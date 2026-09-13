@@ -64,9 +64,22 @@ def main(argv=None) -> None:
     cpc.add_argument("--output", default="runs/cifar10-cpc")
     cpc.add_argument("--device", choices=["auto","cpu","cuda","mps"], default="mps")
     cpc.add_argument("--dry-run", action="store_true", help="Validate and print the protocol without training or writing artifacts")
+    neuron = subparsers.add_parser(
+        "neuron-surgery-study",
+        help="Repair the factor-100 CIFAR-10-LT teacher channels, then run matched KD")
+    neuron.add_argument("--baseline", default="runs/cifar10-lt-multiseed")
+    neuron.add_argument("--output", default="runs/cifar10-lt-neuron-surgery")
+    neuron.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    neuron.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
+    neuron.add_argument("--dry-run", action="store_true",
+                        help="Validate inputs and print the frozen protocol without writing artifacts")
     args = parser.parse_args(argv)
     try:
-        if args.command == "cpc-study":
+        if args.command == "neuron-surgery-study":
+            from .neuron_surgery_study import run_neuron_surgery_study
+            report = run_neuron_surgery_study(args.baseline, args.output, args.device,
+                                              tuple(args.seeds), dry_run=args.dry_run)
+        elif args.command == "cpc-study":
             from .cpc_study import run_cpc_study
             report = run_cpc_study(args.baseline,args.output,args.device,dry_run=args.dry_run)
         elif args.command == "calibration-study":

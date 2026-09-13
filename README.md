@@ -14,6 +14,8 @@ The [calibration-loss intervention](docs/calibration-intervention.md) adds an op
 
 [Sample/slice surgery before KD](docs/sample-surgery-kd.md) diagnoses a frozen checkpoint on canonical, non-augmented training images, reports weak true-class and confusion slices, and writes a bounded list of dataset-local samples that a subsequent KD run can drop. It is opt-in and records the complete intervention in run provenance.
 
+[Channel-level teacher repair before KD](docs/neuron-surgery-kd.md) adapts AI-Lancet to the factor-100 CIFAR-10-LT resources in this workspace. It uses same-class feature companions and bootstrap consensus to localize `stage2`/`stage3` channels, fine-tunes only their connected weights under original-teacher preservation KD, and distills a selected repaired teacher into three matched students. No training samples are removed.
+
 The initial workspace contained no application, dataset, or teacher checkpoint. The project now supports **image classification** using CIFAR-10, ImageFolder, and an offline synthetic smoke dataset. It does not yet implement autonomous driving, object detection, semantic segmentation, or transformer distillation tokens. See [design and guideline coverage](docs/design.md) for extension boundaries.
 
 ## Run in the existing Conda environment
@@ -100,6 +102,23 @@ The default score only considers confident mistakes. `high_loss` also considers 
 For the completed CIFAR-10 teacher and split recipe in this workspace, [cifar10_kd_surgery.toml](configs/cifar10_kd_surgery.toml) defines a seed-42 KD arm using `runs/cifar10-surgery/teacher_high_confidence_hybrid_f05.json`.
 
 For the factor-100 long-tail recipe, [cifar10_lt_kd_surgery.toml](configs/cifar10_lt_kd_surgery.toml) records the matched seed-42 arm. Both deletion pilots reduced balanced CIFAR-10 test performance; results and class-level analysis are in [the surgery protocol](docs/sample-surgery-kd.md).
+
+## Run channel-level teacher repair with KD
+
+Validate the fixed factor-100 protocol and existing teacher/student baseline hashes without writing output:
+
+```bash
+python -m kd neuron-surgery-study \
+  --baseline runs/cifar10-lt-multiseed \
+  --output runs/cifar10-lt-neuron-surgery \
+  --device auto \
+  --seeds 42 43 44 \
+  --dry-run
+```
+
+Remove `--dry-run` to localize channels, train the six bounded repair candidates, apply the validation gate, and, only when a repaired teacher qualifies, run the three matched KD students. See [the neuron-surgery protocol](docs/neuron-surgery-kd.md) for the fixed losses, parameter masks, artifact identities, stopping rule, and success criterion.
+
+The completed factor-100 run selected eight `stage3` channels at learning rate 0.001. Mean student tail recall improved by 1.76 percentage points and mean overall accuracy improved by 0.87 points, with tail gains in two of three seeds, so the predeclared transfer rule passed. See the [generated report](runs/cifar10-lt-neuron-surgery/report.md) and [paired comparison](runs/cifar10-lt-neuron-surgery/comparison.json).
 
 ## Run the recommended ablations
 
