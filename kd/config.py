@@ -89,6 +89,27 @@ class CPCConfig:
 
 
 @dataclass(frozen=True)
+class SurgeryConfig:
+    """Opt-in removal of samples selected by a versioned surgery plan."""
+
+    action: str = "none"
+    plan: str | None = None
+    max_drop_fraction: float = 0.2
+
+    def validate(self) -> None:
+        if self.action not in {"none", "drop"}:
+            raise ValueError("surgery.action must be none or drop")
+        if self.action == "drop" and not self.plan:
+            raise ValueError("surgery.plan is required when surgery.action is drop")
+        if self.action == "none" and self.plan is not None:
+            raise ValueError("Set surgery.action to drop when a surgery.plan is supplied")
+        if (isinstance(self.max_drop_fraction, bool)
+                or not math.isfinite(self.max_drop_fraction)
+                or not 0 < self.max_drop_fraction < 1):
+            raise ValueError("surgery.max_drop_fraction must be finite and in (0, 1)")
+
+
+@dataclass(frozen=True)
 class SupervisedLossConfig:
     method: str = "cross_entropy"
     bins: int = 15
@@ -134,6 +155,7 @@ class ExperimentConfig:
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     supervised_loss: SupervisedLossConfig = field(default_factory=SupervisedLossConfig)
     cpc: CPCConfig = field(default_factory=CPCConfig)
+    surgery: SurgeryConfig = field(default_factory=SurgeryConfig)
 
     def validate(self, *, require_teacher: bool = True) -> None:
         if self.task != "classification":
@@ -174,6 +196,7 @@ class ExperimentConfig:
         d = self.distillation
         self.supervised_loss.validate()
         self.cpc.validate()
+        self.surgery.validate()
         if self.cpc.enabled:
             if d.method != "kd" or self.supervised_loss.method != "cross_entropy":
                 raise ValueError("CPC currently requires standard KD with cross-entropy supervision")
@@ -224,7 +247,7 @@ def from_dict(raw: dict) -> ExperimentConfig:
     sections = {"data": DataConfig, "student": ModelConfig, "teacher": ModelConfig,
                 "distillation": DistillationConfig, "train": TrainConfig, "benchmark": BenchmarkConfig,
                 "calibration": CalibrationConfig, "supervised_loss": SupervisedLossConfig,
-                "cpc": CPCConfig}
+                "cpc": CPCConfig, "surgery": SurgeryConfig}
     for name, cls in sections.items():
         if name in raw:
             values = dict(raw[name])

@@ -135,7 +135,9 @@ def long_tailed_subset(targets, indices: list[int], factor: float, seed: int) ->
     return sorted(kept)
 
 
-def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = True) -> DataBundle:
+def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = True,
+               diagnostic: bool = False) -> DataBundle:
+    """Build stable splits; diagnostic mode uses canonical transforms and ordering."""
     splits = {}
     provenance = {"source": data.source}
     if data.source == "synthetic":
@@ -146,10 +148,10 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
                 continue
             splits[split] = SyntheticImages(count, data.num_classes, data.image_size,
                                             train.seed + i * 1_000_000,
-                                            image_transform(data, training=split == "train"))
+                                            image_transform(data, training=split == "train" and not diagnostic))
     elif data.source == "cifar10":
         training = datasets.CIFAR10(data.root, train=True, download=data.download,
-                                   transform=image_transform(data, training=True))
+                                   transform=image_transform(data, training=not diagnostic))
         validation = datasets.CIFAR10(data.root, train=True, download=False,
                                      transform=image_transform(data, training=False))
         train_indices, val_indices = stratified_split(training.targets, data.validation_fraction, data.split_seed)
@@ -188,7 +190,8 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
                 continue
             if not directory.is_dir():
                 raise ValueError(f"Missing dataset split: {directory}")
-            splits[split] = datasets.ImageFolder(directory, image_transform(data, training=split == "train"))
+            splits[split] = datasets.ImageFolder(
+                directory, image_transform(data, training=split == "train" and not diagnostic))
         classes = splits["train"].classes
         if len(classes) != data.num_classes:
             raise ValueError(f"Expected {data.num_classes} classes, found {len(classes)}: {classes}")
@@ -197,7 +200,8 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
                 raise ValueError(f"Class names/order differ between train and {split}")
     loaders = {}
     for split, dataset in splits.items():
-        loaders[split] = DataLoader(dataset, batch_size=train.batch_size, shuffle=split == "train",
+        loaders[split] = DataLoader(dataset, batch_size=train.batch_size,
+                                    shuffle=split == "train" and not diagnostic,
                                     num_workers=train.workers, worker_init_fn=seed_worker,
                                     generator=torch.Generator().manual_seed(train.seed))
     provenance["split_sizes"] = {name: len(dataset) for name, dataset in splits.items()}

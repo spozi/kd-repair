@@ -21,6 +21,7 @@ from .data import build_data
 from .losses import DistillationObjective, StageFeatureLoss
 from .metrics import benchmark, check_budget, evaluate, synchronize
 from .models import VisionModel, create_model
+from .surgery import apply_training_surgery
 
 
 def seed_everything(seed: int) -> None:
@@ -117,6 +118,7 @@ def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> di
     torch.set_num_threads(config.train.threads)
     device = resolve_device(config.train.device)
     data = build_data(config.data, config.train, include_test=False)
+    data, surgery_info = apply_training_surgery(data, config)
     student = create_model(config.student.name, config.data.num_classes)
     student_metadata = metadata(config.student.name, data.classes, config.data.image_size, config.data.source)
     if config.student.checkpoint:
@@ -175,6 +177,8 @@ def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> di
             raise ValueError("Resume configuration differs from the original training configuration")
         if state["teacher_sha256"] != teacher_hash:
             raise ValueError("Teacher checkpoint changed since the saved training epoch")
+        if state.get("surgery_plan_sha256") != surgery_info.get("plan_sha256"):
+            raise ValueError("Surgery plan changed since the saved training epoch")
         objective.load_state_dict(state["objective"])
         if adaptive_loss is not None and adaptive_loss.controller.last_epoch.item() != state["epoch"] + 1:
             raise ValueError("Adaptive focal controller state does not match the resumed epoch")
@@ -224,6 +228,7 @@ def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> di
                  "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                  "best_accuracy": best_accuracy, "history": history, "config": config.to_dict(),
                  "teacher_sha256": teacher_hash, "rng": capture_rng(loaders),
+                 "surgery_plan_sha256": surgery_info.get("plan_sha256"),
                  "calibration_controller": controller.state_dict()}
         if improved:
             save_checkpoint(directory / "best.pt", state)
@@ -239,6 +244,7 @@ def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> di
                "initial_student_sha256": initial_student_sha256,
                "supervised_loss": config.supervised_loss.method,
                "data_source": config.data.source, "data": data.provenance,
+               "surgery": surgery_info,
                "synthetic_smoke_only": config.data.source == "synthetic",
                "best_epoch": best["epoch"] + 1, "validation": quality, "teacher": teacher_info,
                "calibration_controller": controller.state_dict(),

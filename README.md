@@ -12,6 +12,8 @@ The [calibration-loss intervention](docs/calibration-intervention.md) adds an op
 
 [AdaFocal and AdaDualFocal during student KD](docs/adaptive-focal-kd.md) are optional supervised-loss strategies with per-bin validation feedback and checkpointed gamma schedules. Ready-to-run CIFAR-10 configurations reuse the existing frozen teacher; these combinations have implementation tests, not a completed CIFAR-10 comparison.
 
+[Sample/slice surgery before KD](docs/sample-surgery-kd.md) diagnoses a frozen checkpoint on canonical, non-augmented training images, reports weak true-class and confusion slices, and writes a bounded list of dataset-local samples that a subsequent KD run can drop. It is opt-in and records the complete intervention in run provenance.
+
 The initial workspace contained no application, dataset, or teacher checkpoint. The project now supports **image classification** using CIFAR-10, ImageFolder, and an offline synthetic smoke dataset. It does not yet implement autonomous driving, object detection, semantic segmentation, or transformer distillation tokens. See [design and guideline coverage](docs/design.md) for extension boundaries.
 
 ## Run in the existing Conda environment
@@ -65,6 +67,40 @@ Available model adapters: `tiny_small`, `tiny_medium`, `tiny_large`, `resnet18`,
 
 For a supervised student, set `distillation.method = "supervised"` and `feature_weight = 0.0`. For classical KD, set `method = "kd"`. For DKD, use `method = "dkd"`. Choose a separate run `name` for each experiment.
 
+## Run sample/slice surgery with KD
+
+Generate a plan from a compatible frozen checkpoint. A training-split plan is required to modify training; validation and test plans are diagnostic only.
+
+```bash
+python -m kd surgery-plan \
+  --config configs/teacher.toml \
+  --checkpoint runs/teacher/student.pt \
+  --output runs/surgery/teacher-plan.json \
+  --split train \
+  --score high_confidence_error \
+  --strategy hybrid \
+  --fraction 0.05
+```
+
+Then add the intervention to the student configuration and run KD normally:
+
+```toml
+[surgery]
+action = "drop"
+plan = "runs/surgery/teacher-plan.json"
+max_drop_fraction = 0.10
+```
+
+```bash
+python -m kd train --config configs/student.toml
+```
+
+The default score only considers confident mistakes. `high_loss` also considers correctly predicted hard examples and should be treated as a separate ablation. See [the surgery protocol](docs/sample-surgery-kd.md) for the plan fields, slice strategy, guardrails, and matched controls.
+
+For the completed CIFAR-10 teacher and split recipe in this workspace, [cifar10_kd_surgery.toml](configs/cifar10_kd_surgery.toml) defines a seed-42 KD arm using `runs/cifar10-surgery/teacher_high_confidence_hybrid_f05.json`.
+
+For the factor-100 long-tail recipe, [cifar10_lt_kd_surgery.toml](configs/cifar10_lt_kd_surgery.toml) records the matched seed-42 arm. Both deletion pilots reduced balanced CIFAR-10 test performance; results and class-level analysis are in [the surgery protocol](docs/sample-surgery-kd.md).
+
 ## Run the recommended ablations
 
 ```bash
@@ -108,7 +144,7 @@ Let `r = min((epoch + 1) / warmup_epochs, 1)`, or `1` when warmup is disabled. T
 
 DKD defaults to `alpha=1`, `beta=8`, `T=4`, and `weight=0.5`. The outer DKD weight scales the decoupled response terms; it does not reduce CE. Feature transfer uses explicit stage pairs, learned 1×1 channel projections, bilinear spatial alignment, and normalized feature matching. This is a simple projected stage loss, **not a reproduction of ReviewKD**.
 
-Both networks see the very same transformed tensor. Basic augmentation uses a resized crop. Strong augmentation increases crop variation and adds color jitter and occasional blur. Horizontal flipping defaults to **off**, because directional labels may change under reflection. Configure it only when class semantics permit. No examples are discarded because the teacher predicted the wrong label.
+Both networks see the very same transformed tensor. Basic augmentation uses a resized crop. Strong augmentation increases crop variation and adds color jitter and occasional blur. Horizontal flipping defaults to **off**, because directional labels may change under reflection. Configure it only when class semantics permit. By default no examples are discarded; sample removal happens only when an explicit, compatible surgery plan is configured.
 
 ## Teacher assistants
 
@@ -123,6 +159,7 @@ Each run writes:
 | Artifact | Purpose |
 |---|---|
 | `config.json` | Effective configuration |
+| `data.json` | Split provenance and any applied surgery plan hash/counts |
 | `teacher.json` | Teacher quality, capacity ratio, checkpoint hash |
 | `history.json` | Per-epoch losses, accuracy, timing, learning rate |
 | `best.pt` | Full training state from the best validation epoch |

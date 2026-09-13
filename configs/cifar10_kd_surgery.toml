@@ -1,0 +1,48 @@
+name = "kd_surgery_seed42"
+output_dir = "runs/cifar10-surgery"
+task = "classification"
+
+[data]
+source = "cifar10"
+root = "data"
+num_classes = 10
+image_size = 32
+augmentation = "basic"
+horizontal_flip = true
+download = false
+validation_fraction = 0.1
+split_seed = 2026
+
+[student]
+name = "cifar_student"
+
+[teacher]
+name = "cifar_teacher"
+checkpoint = "runs/cifar10/teacher/student.pt"
+
+[distillation]
+method = "kd"
+temperature = 4.0
+weight = 0.5
+warmup_epochs = 5
+feature_weight = 0.0
+
+[train]
+epochs = 20
+batch_size = 128
+learning_rate = 0.05
+momentum = 0.9
+weight_decay = 0.0005
+workers = 0
+seed = 42
+device = "auto"
+threads = 4
+
+[surgery]
+action = "drop"
+plan = "runs/cifar10-surgery/teacher_high_confidence_hybrid_f05.json"
+max_drop_fraction = 0.05
+
+[benchmark]
+warmup = 20
+iterations = 100

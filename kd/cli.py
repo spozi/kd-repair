@@ -4,8 +4,10 @@ import argparse
 import json
 from pathlib import Path
 
+import torch
+
 from .config import from_dict, load_config
-from .engine import evaluate_checkpoint, run_experiment
+from .engine import evaluate_checkpoint, resolve_device, run_experiment, seed_everything
 from .experiments import grid_configs, run_ablation, run_smoke
 
 
@@ -30,6 +32,20 @@ def main(argv=None) -> None:
     evaluate.add_argument("--config", required=True)
     evaluate.add_argument("--checkpoint", required=True)
     evaluate.add_argument("--split", choices=["val", "test"], default="test")
+    surgery = subparsers.add_parser(
+        "surgery-plan", help="Rank harmful samples and class/confusion slices from a checkpoint")
+    surgery.add_argument("--config", required=True)
+    surgery.add_argument("--checkpoint", required=True)
+    surgery.add_argument("--output", required=True)
+    surgery.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"],
+                         help="Override train.device for diagnostics")
+    surgery.add_argument("--split", choices=["train", "val", "test"], default="train")
+    surgery.add_argument("--fraction", type=float, default=0.05)
+    surgery.add_argument("--max-samples", type=int)
+    surgery.add_argument("--score", choices=["high_loss", "high_confidence_error"],
+                         default="high_confidence_error")
+    surgery.add_argument("--strategy", choices=["sample", "slice", "hybrid"], default="hybrid")
+    surgery.add_argument("--min-slice-size", type=int, default=2)
     smoke = subparsers.add_parser("smoke", help="Run offline synthetic teacher training and all ablations on CPU")
     smoke.add_argument("--output", default="runs/smoke")
     cifar = subparsers.add_parser("cifar10", help="Run the full held-out, repeated-seed CIFAR-10 study")
@@ -67,6 +83,25 @@ def main(argv=None) -> None:
                 report = run_experiment(config, resume=args.resume)
             elif args.command == "evaluate":
                 report = evaluate_checkpoint(config, args.checkpoint, args.split)
+            elif args.command == "surgery-plan":
+                from .surgery import create_surgery_plan
+                seed_everything(config.train.seed)
+                torch.set_num_threads(config.train.threads)
+                plan = create_surgery_plan(
+                    config, args.checkpoint, args.output,
+                    resolve_device(args.device or config.train.device),
+                    split=args.split, fraction=args.fraction, max_samples=args.max_samples,
+                    score=args.score, strategy=args.strategy,
+                    min_slice_size=args.min_slice_size)
+                report = {
+                    "kind": plan["kind"],
+                    "output": str(Path(args.output).resolve()),
+                    "model": plan["model"],
+                    "selection": plan["selection"],
+                    "baseline": plan["baseline"],
+                    "top_true_class_slices": plan["slices"]["true_class"][:5],
+                    "largest_confusion_slices": plan["slices"]["confusion"][:5],
+                }
             elif args.dry_run:
                 report = {"initial_grid": [c.to_dict() for c in grid_configs(config, args.temperatures, args.weights)],
                           "adaptive_steps": ["Best DKD + stage features", "Best preceding variant + strong augmentation"]}
