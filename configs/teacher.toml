@@ -1,0 +1,25 @@
+# Replace root, class count, and training schedule for your dataset.
+name = "teacher"
+output_dir = "runs"
+
+[data]
+source = "imagefolder"
+root = "data/images"
+num_classes = 4
+image_size = 224
+augmentation = "basic"
+horizontal_flip = false
+
+[student]
+name = "resnet34"
+
+[distillation]
+method = "supervised"
+
+[train]
+epochs = 100
+batch_size = 32
+learning_rate = 0.05
+device = "auto"
+seed = 42
+

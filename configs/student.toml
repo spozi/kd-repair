@@ -1,0 +1,43 @@
+name = "student_dkd"
+output_dir = "runs"
+
+[data]
+source = "imagefolder"
+root = "data/images"
+num_classes = 4
+image_size = 224
+augmentation = "basic"
+horizontal_flip = false
+
+[student]
+name = "resnet18"
+
+[teacher]
+name = "resnet34"
+checkpoint = "runs/teacher/student.pt"
+
+[distillation]
+method = "dkd"
+temperature = 4.0
+weight = 0.5
+alpha = 1.0
+beta = 8.0
+warmup_epochs = 5
+feature_weight = 0.0
+stage_pairs = [["stage2", "stage2"], ["stage3", "stage3"]]
+
+[train]
+epochs = 100
+batch_size = 32
+learning_rate = 0.05
+device = "auto"
+seed = 42
+
+[benchmark]
+warmup = 10
+iterations = 50
+# Set real target-device limits before selecting a deployment candidate.
+# max_parameters = 12000000
+# max_flops = 4000000000
+# max_latency_ms = 30.0
+

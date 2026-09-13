@@ -1,0 +1,27 @@
+# Optional teacher -> assistant stage; use its student.pt as the next teacher.
+name = "assistant"
+output_dir = "runs"
+
+[data]
+source = "imagefolder"
+root = "data/images"
+num_classes = 4
+image_size = 224
+
+[student]
+name = "resnet18"
+
+[teacher]
+name = "resnet34"
+checkpoint = "runs/teacher/student.pt"
+
+[distillation]
+method = "dkd"
+temperature = 4.0
+weight = 0.5
+
+[train]
+epochs = 100
+batch_size = 32
+learning_rate = 0.05
+

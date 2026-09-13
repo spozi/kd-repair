@@ -1,0 +1,44 @@
+name = "kd_cpc_seed42"
+output_dir = "runs/cifar10-cpc-standalone"
+
+[data]
+source = "cifar10"
+root = "data"
+num_classes = 10
+image_size = 32
+horizontal_flip = true
+validation_fraction = 0.1
+split_seed = 2026
+
+[student]
+name = "cifar_student"
+
+[teacher]
+name = "cifar_teacher"
+checkpoint = "runs/cifar10/teacher/student.pt"
+
+[distillation]
+method = "kd"
+temperature = 4.0
+weight = 0.5
+warmup_epochs = 5
+
+[cpc]
+enabled = true
+discrimination_weight = 0.1
+exclusion_weight = 0.1
+
+[train]
+epochs = 20
+batch_size = 128
+learning_rate = 0.05
+momentum = 0.9
+weight_decay = 0.0005
+workers = 0
+threads = 4
+device = "mps"
+seed = 42
+
+[benchmark]
+warmup = 20
+iterations = 100
