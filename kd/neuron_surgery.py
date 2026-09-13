@@ -13,7 +13,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 
 from .losses import LogitsKD
-from .models import CifarCNN, ModelOutput
+from .models import CifarCNN, ModelOutput, ResNetAdapter, VisionModel
 
 
 FORMAT_VERSION = 1
@@ -21,10 +21,27 @@ LOCALIZATION_STAGES = ("stage2", "stage3")
 TAIL_CLASSES = (5, 6, 7, 8, 9)
 
 
-def collect_teacher_diagnostics(model: CifarCNN, loader, device: torch.device) -> tuple[list[dict], np.ndarray]:
-    """Collect canonical predictions and normalized stage-3 embeddings in dataset order."""
-    if not isinstance(model, CifarCNN):
-        raise ValueError("Neuron surgery version 1 supports CifarCNN only")
+def localization_stages(model: VisionModel) -> tuple[str, ...]:
+    """Return the bounded late-stage search space for a supported teacher."""
+    if isinstance(model, CifarCNN):
+        return LOCALIZATION_STAGES
+    if isinstance(model, ResNetAdapter):
+        return ("stage3", "stage4")
+    raise ValueError("Neuron surgery supports CifarCNN and torchvision ResNet adapters")
+
+
+def _stage_module(model: VisionModel, stage: str) -> nn.Module:
+    if stage not in localization_stages(model):
+        raise ValueError(f"Stage {stage!r} is not repairable for {type(model).__name__}")
+    if isinstance(model, CifarCNN):
+        return model.stages[stage]
+    return getattr(model.backbone, f"layer{int(stage.removeprefix('stage'))}")
+
+
+def collect_teacher_diagnostics(model: VisionModel, loader,
+                                device: torch.device) -> tuple[list[dict], np.ndarray]:
+    """Collect canonical predictions and normalized final-stage embeddings in dataset order."""
+    embedding_stage = localization_stages(model)[-1]
     previous_mode = model.training
     model.eval()
     records: list[dict] = []
@@ -42,7 +59,8 @@ def collect_teacher_diagnostics(model: CifarCNN, loader, device: torch.device) -
                 probability = log_probability.exp()
                 confidence, prediction = probability.max(1)
                 nll = -log_probability.gather(1, labels_device[:, None]).squeeze(1)
-                embedding = F.adaptive_avg_pool2d(output.features["stage3"].float(), 1).flatten(1)
+                embedding = F.adaptive_avg_pool2d(
+                    output.features[embedding_stage].float(), 1).flatten(1)
                 embeddings.append(F.normalize(embedding, dim=1).cpu().numpy())
                 rows = zip(labels.tolist(), prediction.cpu().tolist(), confidence.cpu().tolist(),
                            nll.cpu().tolist())
@@ -157,14 +175,16 @@ class CompanionDataset(Dataset):
         return target_image, int(target_label), target_index, torch.stack(images)
 
 
-def differential_channel_scores(model: CifarCNN, dataset: Dataset, companion_records: list[dict],
-                                device: torch.device, *, batch_size: int = 16,
-                                stages: tuple[str, ...] = LOCALIZATION_STAGES) -> dict[str, np.ndarray]:
-    """Score target channels by companion difference times error-margin gradient."""
-    if not isinstance(model, CifarCNN):
-        raise ValueError("Neuron surgery version 1 supports CifarCNN only")
-    if any(stage not in LOCALIZATION_STAGES for stage in stages):
-        raise ValueError(f"Localization stages must be drawn from {LOCALIZATION_STAGES}")
+def differential_channel_scores(model: VisionModel, dataset: Dataset,
+                                companion_records: list[dict], device: torch.device, *,
+                                batch_size: int = 16, stages: tuple[str, ...] | None = None,
+                                score_mode: str = "differential") -> dict[str, np.ndarray]:
+    """Score target channels with differential or gradient-only attribution."""
+    stages = localization_stages(model) if stages is None else tuple(stages)
+    if not stages or any(stage not in localization_stages(model) for stage in stages):
+        raise ValueError(f"Localization stages must be drawn from {localization_stages(model)}")
+    if score_mode not in {"differential", "gradient_only"}:
+        raise ValueError("score_mode must be differential or gradient_only")
     loader = DataLoader(CompanionDataset(dataset, companion_records), batch_size=batch_size,
                         shuffle=False, num_workers=0)
     previous_mode = model.training
@@ -185,16 +205,21 @@ def differential_channel_scores(model: CifarCNN, dataset: Dataset, companion_rec
                 1, labels_device[:, None]).squeeze(1)
             margin.sum().backward()
             batch, count = companion_images.shape[:2]
-            with torch.no_grad():
-                companion_output = model(companion_images.flatten(0, 1).to(device),
-                                         return_features=True)
+            companion_output = None
+            if score_mode == "differential":
+                with torch.no_grad():
+                    companion_output = model(companion_images.flatten(0, 1).to(device),
+                                             return_features=True)
             for stage in stages:
                 target_feature = target_output.features[stage].detach()
-                companion_feature = companion_output.features[stage].reshape(
-                    batch, count, *target_feature.shape[1:])
-                difference = (target_feature[:, None] - companion_feature).abs().mean((1, 3, 4))
                 sensitivity = target_output.features[stage].grad.abs().mean((2, 3))
-                score = difference * sensitivity
+                if companion_output is None:
+                    score = sensitivity
+                else:
+                    companion_feature = companion_output.features[stage].reshape(
+                        batch, count, *target_feature.shape[1:])
+                    difference = (target_feature[:, None] - companion_feature).abs().mean((1, 3, 4))
+                    score = difference * sensitivity
                 score = score / score.mean(1, keepdim=True).clamp_min(torch.finfo(score.dtype).eps)
                 if not torch.isfinite(score).all():
                     raise FloatingPointError("Non-finite differential channel score")
@@ -212,10 +237,16 @@ def differential_channel_scores(model: CifarCNN, dataset: Dataset, companion_rec
 
 def consensus_channel_ranking(scores: dict[str, np.ndarray], *, target_classes: Iterable[int] = TAIL_CLASSES,
                               repetitions: int = 20, seed: int = 2026,
-                              top_fraction: float = 0.25, stability_threshold: float = 0.7) -> dict:
+                              top_fraction: float = 0.25, stability_threshold: float = 0.7,
+                              stages: tuple[str, ...] | None = None) -> dict:
     """Aggregate per-target scores with equal class weight and bootstrap stability."""
     labels = np.asarray(scores["labels"], dtype=np.int64)
-    stages = [stage for stage in LOCALIZATION_STAGES if stage in scores]
+    if stages is None:
+        stages = tuple(stage for stage, values in scores.items()
+                       if stage not in {"labels", "target_indices"}
+                       and np.asarray(values).ndim == 2)
+    else:
+        stages = tuple(stages)
     if not stages or repetitions < 1 or not 0 < top_fraction <= 1 or not 0 <= stability_threshold <= 1:
         raise ValueError("Invalid consensus configuration")
     matrices = [np.asarray(scores[stage], dtype=np.float64) for stage in stages]
@@ -259,10 +290,10 @@ def consensus_channel_ranking(scores: dict[str, np.ndarray], *, target_classes: 
 
 
 @contextmanager
-def ablate_channel(model: CifarCNN, stage: str, channel: int):
+def ablate_channel(model: VisionModel, stage: str, channel: int):
     """Temporarily zero one stage output channel and always remove the hook."""
-    if not isinstance(model, CifarCNN) or stage not in LOCALIZATION_STAGES:
-        raise ValueError("Ablation supports CifarCNN stage2/stage3 only")
+    if stage not in localization_stages(model):
+        raise ValueError(f"Ablation stages must be drawn from {localization_stages(model)}")
     if not 0 <= channel < model.feature_channels[stage]:
         raise ValueError(f"Channel {channel} is outside {stage}")
 
@@ -271,7 +302,7 @@ def ablate_channel(model: CifarCNN, stage: str, channel: int):
         changed[:, channel] = 0
         return changed
 
-    handle = model.stages[stage].register_forward_hook(hook)
+    handle = _stage_module(model, stage).register_forward_hook(hook)
     try:
         yield
     finally:
@@ -279,7 +310,7 @@ def ablate_channel(model: CifarCNN, stage: str, channel: int):
 
 
 @torch.inference_mode()
-def measure_repair_set(model: CifarCNN, loader, device: torch.device,
+def measure_repair_set(model: VisionModel, loader, device: torch.device,
                        balanced_classes: Iterable[int] | None = None) -> dict:
     """Measure accuracy, NLL, and an equally weighted true-versus-rival margin."""
     previous_mode = model.training
@@ -312,7 +343,7 @@ def measure_repair_set(model: CifarCNN, loader, device: torch.device,
             "class_balanced_margin": float(np.mean([np.mean(margins[label]) for label in classes]))}
 
 
-def causal_channel_validation(model: CifarCNN, target_loader, preservation_loader,
+def causal_channel_validation(model: VisionModel, target_loader, preservation_loader,
                               consensus: dict, device: torch.device, *,
                               target_classes: Iterable[int] = TAIL_CLASSES,
                               accuracy_guardrail: float = 0.005) -> dict:
@@ -342,15 +373,16 @@ def causal_channel_validation(model: CifarCNN, target_loader, preservation_loade
             "ranking": [{"stage": row["stage"], "channel": row["channel"]} for row in retained]}
 
 
-def cifar_channel_parameter_masks(model: CifarCNN, channels: Iterable[dict]) -> dict[str, Tensor]:
-    """Map stage channels to producer, BN-affine, and downstream consumer weights."""
-    if not isinstance(model, CifarCNN):
-        raise ValueError("Masked channel repair supports CifarCNN only")
-    masks = {name: torch.zeros_like(parameter, dtype=torch.bool)
-             for name, parameter in model.named_parameters()}
+def _empty_parameter_masks(model: nn.Module) -> dict[str, Tensor]:
+    return {name: torch.zeros_like(parameter, dtype=torch.bool)
+            for name, parameter in model.named_parameters()}
+
+
+def _cifar_parameter_masks(model: CifarCNN, channels: Iterable[dict]) -> dict[str, Tensor]:
+    masks = _empty_parameter_masks(model)
     for row in channels:
         stage, channel = str(row["stage"]), int(row["channel"])
-        if stage not in LOCALIZATION_STAGES or not 0 <= channel < model.feature_channels[stage]:
+        if stage not in localization_stages(model) or not 0 <= channel < model.feature_channels[stage]:
             raise ValueError(f"Invalid repair channel {stage}:{channel}")
         masks[f"stages.{stage}.3.weight"][channel] = True
         masks[f"stages.{stage}.4.weight"][channel] = True
@@ -359,9 +391,63 @@ def cifar_channel_parameter_masks(model: CifarCNN, channels: Iterable[dict]) -> 
             masks["stages.stage3.0.weight"][:, channel] = True
         else:
             masks["classifier.weight"][:, channel * 4:(channel + 1) * 4] = True
+    return masks
+
+
+def _resnet_parameter_masks(model: ResNetAdapter, channels: Iterable[dict]) -> dict[str, Tensor]:
+    """Map a late ResNet stage channel through its terminal block and consumers."""
+    masks = _empty_parameter_masks(model)
+    for row in channels:
+        stage, channel = str(row["stage"]), int(row["channel"])
+        if stage not in localization_stages(model) or not 0 <= channel < model.feature_channels[stage]:
+            raise ValueError(f"Invalid repair channel {stage}:{channel}")
+        number = int(stage.removeprefix("stage"))
+        layer = getattr(model.backbone, f"layer{number}")
+        block_index = len(layer) - 1
+        block = layer[block_index]
+        suffix = "3" if hasattr(block, "conv3") else "2"
+        prefix = f"backbone.layer{number}.{block_index}"
+        masks[f"{prefix}.conv{suffix}.weight"][channel] = True
+        masks[f"{prefix}.bn{suffix}.weight"][channel] = True
+        masks[f"{prefix}.bn{suffix}.bias"][channel] = True
+        if number == 4:
+            masks["backbone.fc.weight"][:, channel] = True
+            continue
+        consumer = f"backbone.layer{number + 1}.0"
+        masks[f"{consumer}.conv1.weight"][:, channel] = True
+        downsample_name = f"{consumer}.downsample.0.weight"
+        if downsample_name in masks:
+            masks[downsample_name][:, channel] = True
+    return masks
+
+
+def channel_parameter_masks(model: VisionModel, channels: Iterable[dict]) -> dict[str, Tensor]:
+    """Map channels to producer rows, BN affine entries, and direct consumers."""
+    channels = list(channels)
+    if isinstance(model, CifarCNN):
+        masks = _cifar_parameter_masks(model, channels)
+    elif isinstance(model, ResNetAdapter):
+        masks = _resnet_parameter_masks(model, channels)
+    else:
+        raise ValueError("Masked channel repair supports CifarCNN and ResNet adapters")
     if not any(mask.any().item() for mask in masks.values()):
         raise ValueError("At least one channel must be selected for repair")
     return masks
+
+
+def cifar_channel_parameter_masks(model: CifarCNN, channels: Iterable[dict]) -> dict[str, Tensor]:
+    """Backward-compatible strict CifarCNN channel map."""
+    if not isinstance(model, CifarCNN):
+        raise ValueError("Expected a CifarCNN repair teacher")
+    return channel_parameter_masks(model, channels)
+
+
+def resnet_channel_parameter_masks(model: ResNetAdapter,
+                                   channels: Iterable[dict]) -> dict[str, Tensor]:
+    """Strict torchvision ResNet late-stage channel map."""
+    if not isinstance(model, ResNetAdapter):
+        raise ValueError("Expected a ResNetAdapter repair teacher")
+    return channel_parameter_masks(model, channels)
 
 
 @contextmanager
@@ -387,7 +473,11 @@ def masked_parameters(model: nn.Module, masks: dict[str, Tensor]):
 
 
 def same_model_feature_loss(candidate: dict[str, Tensor], anchor: dict[str, Tensor],
-                            stages: tuple[str, ...] = LOCALIZATION_STAGES) -> Tensor:
+                            stages: tuple[str, ...] | None = None) -> Tensor:
+    if stages is None:
+        stages = tuple(stage for stage in candidate if stage in anchor)
+    if not stages:
+        raise ValueError("Feature preservation requires at least one shared stage")
     losses = []
     for stage in stages:
         losses.append((F.normalize(candidate[stage].float(), dim=1)
@@ -398,13 +488,16 @@ def same_model_feature_loss(candidate: dict[str, Tensor], anchor: dict[str, Tens
 def repair_loss(candidate_target: ModelOutput, target_labels: Tensor,
                 candidate_preservation: ModelOutput, anchor_preservation: ModelOutput,
                 preservation_labels: Tensor, *, temperature: float = 4.0,
-                feature_weight: float = 0.25) -> dict[str, Tensor]:
+                kd_weight: float = 1.0, feature_weight: float = 0.25,
+                feature_stages: tuple[str, ...] | None = None) -> dict[str, Tensor]:
+    if kd_weight < 0 or feature_weight < 0:
+        raise ValueError("Repair preservation weights must be nonnegative")
     ce = F.cross_entropy(candidate_target.logits, target_labels)
     kd = LogitsKD(temperature)(candidate_preservation.logits, anchor_preservation.logits,
                                preservation_labels)
     features = same_model_feature_loss(candidate_preservation.features,
-                                       anchor_preservation.features)
-    return {"total": ce + kd + feature_weight * features, "ce": ce, "kd": kd,
+                                       anchor_preservation.features, feature_stages)
+    return {"total": ce + kd_weight * kd + feature_weight * features, "ce": ce, "kd": kd,
             "features": features}
 
 
@@ -434,13 +527,15 @@ def _balanced_weights(indices: list[int], labels: np.ndarray) -> Tensor:
     return torch.tensor([1.0 / counts[label] for label in selected_labels], dtype=torch.double)
 
 
-def train_repair_candidate(candidate: CifarCNN, anchor: CifarCNN, dataset: Dataset,
+def train_repair_candidate(candidate: VisionModel, anchor: VisionModel, dataset: Dataset,
                            labels: np.ndarray, target_indices: list[int],
                            preservation_indices: list[int], channels: list[dict],
                            device: torch.device, *, epochs: int = 20, samples_per_epoch: int = 640,
                            batch_size: int = 64, learning_rate: float = 0.001,
                            momentum: float = 0.9, temperature: float = 4.0,
-                           feature_weight: float = 0.25, seed: int = 2026) -> tuple[list[dict], dict]:
+                           kd_weight: float = 1.0, feature_weight: float = 0.25,
+                           feature_stages: tuple[str, ...] | None = None,
+                           seed: int = 2026) -> tuple[list[dict], dict]:
     """Fine-tune only selected channel-connected weights under anchor-teacher KD."""
     if min(epochs, samples_per_epoch, batch_size) < 1:
         raise ValueError("Repair epochs, samples_per_epoch, and batch_size must be positive")
@@ -450,7 +545,10 @@ def train_repair_candidate(candidate: CifarCNN, anchor: CifarCNN, dataset: Datas
     torch.manual_seed(seed)
     candidate.to(device).eval()
     anchor.to(device).requires_grad_(False).eval()
-    masks = cifar_channel_parameter_masks(candidate, channels)
+    if type(candidate) is not type(anchor) or candidate.feature_channels != anchor.feature_channels:
+        raise ValueError("Candidate and anchor must use the same repair architecture")
+    feature_stages = localization_stages(candidate) if feature_stages is None else tuple(feature_stages)
+    masks = channel_parameter_masks(candidate, channels)
     before = {name: value.detach().cpu().clone() for name, value in candidate.state_dict().items()}
     target_sampler = WeightedRandomSampler(_balanced_weights(target_indices, labels), samples_per_epoch,
                                            replacement=True, generator=torch.Generator().manual_seed(seed))
@@ -480,7 +578,8 @@ def train_repair_candidate(candidate: CifarCNN, anchor: CifarCNN, dataset: Datas
                     anchor_output = anchor(preserve_images, return_features=True)
                 losses = repair_loss(target_output, target_labels, preserve_output, anchor_output,
                                      preserve_labels, temperature=temperature,
-                                     feature_weight=feature_weight)
+                                     kd_weight=kd_weight, feature_weight=feature_weight,
+                                     feature_stages=feature_stages)
                 if not torch.isfinite(losses["total"]):
                     raise FloatingPointError("Non-finite neuron-repair loss")
                 losses["total"].backward()

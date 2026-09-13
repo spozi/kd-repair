@@ -1,0 +1,15 @@
+{
+  "name": "resnet-f100-full",
+  "imbalance_factor": 100.0,
+  "teacher_run": "teacher_resnet34_f100",
+  "student_run_template": "kd_resnet18_f100_seed{seed}",
+  "teacher_model": "resnet34",
+  "student_model": "resnet18",
+  "teacher_seed": 241,
+  "student_seeds": [242, 243, 244],
+  "split_seed": 9101,
+  "training_epochs": 81,
+  "stages": ["stage3", "stage4"],
+  "expected_train_counts": null,
+  "expected_target_counts": null
+}

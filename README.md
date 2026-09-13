@@ -120,6 +120,18 @@ Remove `--dry-run` to localize channels, train the six bounded repair candidates
 
 The completed factor-100 run selected eight `stage3` channels at learning rate 0.001. Mean student tail recall improved by 1.76 percentage points and mean overall accuracy improved by 0.87 points, with tail gains in two of three seeds, so the predeclared transfer rule passed. See the [generated report](runs/cifar10-lt-neuron-surgery/report.md) and [paired comparison](runs/cifar10-lt-neuron-surgery/comparison.json).
 
+The [follow-up campaign](docs/neuron-surgery-campaign.md) adds a fresh-output reproduction, a sealed balanced holdout drawn from the CIFAR-10 training archive, validation-only component ablations, factors 10 and 50, and late-stage ResNet channel maps. Validate the complete sequential campaign without training:
+
+```bash
+python -m kd neuron-surgery-campaign \
+  --output runs/cifar10-lt-neuron-campaign \
+  --root data \
+  --device auto \
+  --dry-run
+```
+
+Individual generalized studies use `--study-config configs/neuron_surgery/NAME.json`. Missing matched controls can be generated with `python -m kd neuron-surgery-baselines --study-config ...`.
+
 ## Run the recommended ablations
 
 ```bash

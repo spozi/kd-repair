@@ -362,4 +362,5 @@ def apply_training_surgery(data: DataBundle, config: ExperimentConfig) -> tuple[
     provenance = dict(data.provenance)
     provenance["split_sizes"] = {**provenance.get("split_sizes", {}), "train": len(kept)}
     provenance["surgery"] = info
-    return DataBundle(loader, data.val, data.classes, data.test, provenance), info
+    return DataBundle(loader, data.val, data.classes, data.test, provenance,
+                      data.confirmation), info

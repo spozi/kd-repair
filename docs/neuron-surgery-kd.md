@@ -97,3 +97,25 @@ improved in seeds 43 and 44 and declined by 0.12 points in seed 42, satisfying
 the predeclared two-of-three rule. The complete per-seed metrics, calibration
 bootstraps, and class recalls are in the [generated report](../runs/cifar10-lt-neuron-surgery/report.md)
 and [comparison data](../runs/cifar10-lt-neuron-surgery/comparison.json).
+
+## Generalized protocol
+
+Version 2 accepts a frozen JSON `NeuronSurgerySpec` while retaining the original
+factor-100 defaults. The supported repair maps are:
+
+- `CifarCNN`: `stage2` and `stage3`, with the original convolution, BatchNorm,
+  next-stage, and four-cell classifier mapping.
+- torchvision ResNet-18/34/50: `stage3` and `stage4`, using the final basic or
+  bottleneck convolution row, matching BatchNorm affine entries, the next
+  residual stage's first convolution and projection consumers, or the final
+  classifier column.
+
+The optional `confirmation_fraction` reserves a deterministic balanced subset
+of the CIFAR-10 training archive. It is excluded from fitting, epoch selection,
+repair localization, and teacher selection; its loader is not constructed until
+the repaired teacher and all student checkpoints are frozen.
+
+Component ablations can set `kd_weight = 0`, `score_mode = "gradient_only"`, or
+`causal_validation = false`. Setting `downstream_kd = false` makes these
+validation-only teacher ablations, avoiding redundant 81-epoch student runs.
+See [the campaign protocol](neuron-surgery-campaign.md) for the fixed matrix.

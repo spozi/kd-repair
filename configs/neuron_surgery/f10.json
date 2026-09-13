@@ -1,0 +1,9 @@
+{
+  "name": "cifar-cnn-f10-full",
+  "imbalance_factor": 10.0,
+  "teacher_run": "teacher_f10",
+  "student_run_template": "kd_f10_seed{seed}",
+  "training_epochs": 49,
+  "expected_train_counts": null,
+  "expected_target_counts": null
+}

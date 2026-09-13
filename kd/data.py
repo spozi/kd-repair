@@ -76,6 +76,7 @@ class DataBundle:
     classes: list[str]
     test: DataLoader | None = None
     provenance: dict = field(default_factory=dict)
+    confirmation: DataLoader | None = None
 
 
 def seed_worker(worker_id: int) -> None:
@@ -97,6 +98,25 @@ def stratified_split(targets, fraction: float, seed: int) -> tuple[list[int], li
         validation.extend(indices[:count].tolist())
         training.extend(indices[count:].tolist())
     return sorted(training), sorted(validation)
+
+
+def stratified_confirmation_split(targets, validation_fraction: float,
+                                  confirmation_fraction: float,
+                                  seed: int) -> tuple[list[int], list[int], list[int]]:
+    """Create disjoint train/validation/confirmation partitions per class."""
+    labels = np.asarray(targets)
+    generator = np.random.default_rng(seed)
+    training, validation, confirmation = [], [], []
+    for label in np.unique(labels):
+        indices = generator.permutation(np.flatnonzero(labels == label))
+        val_count = round(len(indices) * validation_fraction)
+        confirmation_count = round(len(indices) * confirmation_fraction)
+        if min(val_count, confirmation_count) < 1 or val_count + confirmation_count >= len(indices):
+            raise ValueError("Each class needs train, validation, and confirmation examples")
+        validation.extend(indices[:val_count].tolist())
+        confirmation.extend(indices[val_count:val_count + confirmation_count].tolist())
+        training.extend(indices[val_count + confirmation_count:].tolist())
+    return sorted(training), sorted(validation), sorted(confirmation)
 
 
 def index_hash(indices: list[int]) -> str:
@@ -136,7 +156,7 @@ def long_tailed_subset(targets, indices: list[int], factor: float, seed: int) ->
 
 
 def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = True,
-               diagnostic: bool = False) -> DataBundle:
+               include_confirmation: bool = False, diagnostic: bool = False) -> DataBundle:
     """Build stable splits; diagnostic mode uses canonical transforms and ordering."""
     splits = {}
     provenance = {"source": data.source}
@@ -154,7 +174,14 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
                                    transform=image_transform(data, training=not diagnostic))
         validation = datasets.CIFAR10(data.root, train=True, download=False,
                                      transform=image_transform(data, training=False))
-        train_indices, val_indices = stratified_split(training.targets, data.validation_fraction, data.split_seed)
+        confirmation_indices = None
+        if data.confirmation_fraction:
+            train_indices, val_indices, confirmation_indices = stratified_confirmation_split(
+                training.targets, data.validation_fraction, data.confirmation_fraction,
+                data.split_seed)
+        else:
+            train_indices, val_indices = stratified_split(
+                training.targets, data.validation_fraction, data.split_seed)
         if data.imbalance_factor > 1:
             # Train and validation share the profile: the calibration set is as
             # skewed as training, which is the setting where a single global
@@ -166,6 +193,10 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
                                              data.imbalance_factor, data.split_seed + 1)
         splits["train"] = Subset(training, train_indices)
         splits["val"] = Subset(validation, val_indices)
+        if include_confirmation and confirmation_indices is not None:
+            confirmation = datasets.CIFAR10(data.root, train=True, download=False,
+                                            transform=image_transform(data, training=False))
+            splits["confirmation"] = Subset(confirmation, confirmation_indices)
         classes = training.classes
         if include_test:
             splits["test"] = datasets.CIFAR10(data.root, train=False, download=False,
@@ -180,6 +211,14 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
             # provenance and the completed studies still verify against it.
             provenance.update(imbalance_factor=data.imbalance_factor,
                               imbalance_profile="Exponential over dataset label order; train and validation resampled, test untouched")
+        if confirmation_indices is not None:
+            provenance.update(
+                confirmation_fraction=data.confirmation_fraction,
+                confirmation_index_sha256=index_hash(confirmation_indices),
+                confirmation_per_class=np.bincount(
+                    np.asarray(training.targets)[confirmation_indices]).tolist(),
+                confirmation_policy=("Balanced sealed holdout excluded from training, validation, "
+                                     "and checkpoint selection"))
     else:
         root = Path(data.root)
         for split in ("train", "val", "test"):
@@ -205,4 +244,5 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
                                     num_workers=train.workers, worker_init_fn=seed_worker,
                                     generator=torch.Generator().manual_seed(train.seed))
     provenance["split_sizes"] = {name: len(dataset) for name, dataset in splits.items()}
-    return DataBundle(loaders["train"], loaders["val"], classes, loaders.get("test"), provenance)
+    return DataBundle(loaders["train"], loaders["val"], classes, loaders.get("test"), provenance,
+                      loaders.get("confirmation"))

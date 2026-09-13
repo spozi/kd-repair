@@ -1,0 +1,5 @@
+{
+  "name": "ablation-no-companion-score",
+  "score_mode": "gradient_only",
+  "downstream_kd": false
+}

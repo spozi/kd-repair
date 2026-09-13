@@ -1,0 +1,14 @@
+{
+  "name": "cifar-cnn-f100-confirmatory",
+  "imbalance_factor": 100.0,
+  "teacher_run": "teacher_f100_confirmatory",
+  "student_run_template": "kd_f100_confirmatory_seed{seed}",
+  "teacher_seed": 141,
+  "student_seeds": [142, 143, 144],
+  "split_seed": 7301,
+  "confirmation_fraction": 0.1,
+  "training_epochs": 81,
+  "evaluation_split": "confirmation",
+  "expected_train_counts": null,
+  "expected_target_counts": null
+}

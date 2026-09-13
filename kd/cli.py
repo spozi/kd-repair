@@ -71,14 +71,53 @@ def main(argv=None) -> None:
     neuron.add_argument("--output", default="runs/cifar10-lt-neuron-surgery")
     neuron.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     neuron.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
+    neuron.add_argument("--study-config",
+                        help="JSON NeuronSurgerySpec; omitted for the original factor-100 protocol")
     neuron.add_argument("--dry-run", action="store_true",
                         help="Validate inputs and print the frozen protocol without writing artifacts")
+    neuron_baselines = subparsers.add_parser(
+        "neuron-surgery-baselines",
+        help="Train matched teacher and KD controls required by a generalized repair study")
+    neuron_baselines.add_argument("--study-config", required=True)
+    neuron_baselines.add_argument("--output", required=True)
+    neuron_baselines.add_argument("--root", default="data")
+    neuron_baselines.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"],
+                                  default="auto")
+    neuron_baselines.add_argument("--dry-run", action="store_true")
+    neuron_campaign = subparsers.add_parser(
+        "neuron-surgery-campaign",
+        help="Run sealed confirmation, ablations, imbalance factors, and ResNet generalization")
+    neuron_campaign.add_argument("--output", default="runs/cifar10-lt-neuron-campaign")
+    neuron_campaign.add_argument("--root", default="data")
+    neuron_campaign.add_argument("--baseline", default="runs/cifar10-lt-multiseed")
+    neuron_campaign.add_argument("--reference", default="runs/cifar10-lt-neuron-surgery")
+    neuron_campaign.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"],
+                                 default="auto")
+    neuron_campaign.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "neuron-surgery-study":
-            from .neuron_surgery_study import run_neuron_surgery_study
-            report = run_neuron_surgery_study(args.baseline, args.output, args.device,
-                                              tuple(args.seeds), dry_run=args.dry_run)
+            from .neuron_surgery_study import (load_neuron_surgery_spec,
+                                               run_neuron_surgery_study)
+            if args.study_config:
+                spec = load_neuron_surgery_spec(args.study_config)
+                report = run_neuron_surgery_study(
+                    args.baseline, args.output, args.device, spec.student_seeds,
+                    dry_run=args.dry_run, spec=spec)
+            else:
+                report = run_neuron_surgery_study(args.baseline, args.output, args.device,
+                                                  tuple(args.seeds), dry_run=args.dry_run)
+        elif args.command == "neuron-surgery-baselines":
+            from .neuron_surgery_baselines import run_neuron_surgery_baselines
+            from .neuron_surgery_study import load_neuron_surgery_spec
+            spec = load_neuron_surgery_spec(args.study_config)
+            report = run_neuron_surgery_baselines(
+                args.output, args.root, args.device, spec, dry_run=args.dry_run)
+        elif args.command == "neuron-surgery-campaign":
+            from .neuron_surgery_campaign import run_neuron_surgery_campaign
+            report = run_neuron_surgery_campaign(
+                args.output, data_root=args.root, legacy_baseline=args.baseline,
+                reference_study=args.reference, device=args.device, dry_run=args.dry_run)
         elif args.command == "cpc-study":
             from .cpc_study import run_cpc_study
             report = run_cpc_study(args.baseline,args.output,args.device,dry_run=args.dry_run)

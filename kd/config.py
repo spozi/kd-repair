@@ -19,6 +19,9 @@ class DataConfig:
     horizontal_flip: bool = False
     download: bool = False
     validation_fraction: float = 0.1
+    # Optional balanced holdout drawn from the training archive and excluded
+    # from both fitting and validation-driven selection.
+    confirmation_fraction: float = 0.0
     split_seed: int = 2026
     # 1.0 keeps every class balanced; >1 applies an exponential long-tailed
     # profile to the training and validation splits only.
@@ -168,6 +171,14 @@ class ExperimentConfig:
             raise ValueError("CIFAR-10 requires num_classes=10 and image_size=32")
         if not 0 < self.data.validation_fraction < 1:
             raise ValueError("validation_fraction must be between zero and one")
+        if (isinstance(self.data.confirmation_fraction, bool)
+                or not math.isfinite(self.data.confirmation_fraction)
+                or not 0 <= self.data.confirmation_fraction < 1):
+            raise ValueError("confirmation_fraction must be finite and in [0, 1)")
+        if self.data.validation_fraction + self.data.confirmation_fraction >= 1:
+            raise ValueError("validation_fraction + confirmation_fraction must be below one")
+        if self.data.confirmation_fraction and self.data.source != "cifar10":
+            raise ValueError("A sealed confirmation split is implemented for cifar10 only")
         if (isinstance(self.data.imbalance_factor, bool) or not math.isfinite(self.data.imbalance_factor)
                 or self.data.imbalance_factor < 1):
             raise ValueError("data.imbalance_factor must be finite and at least one")

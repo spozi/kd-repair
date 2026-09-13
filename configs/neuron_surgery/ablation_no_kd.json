@@ -1,0 +1,5 @@
+{
+  "name": "ablation-no-preservation-kd",
+  "kd_weight": 0.0,
+  "downstream_kd": false
+}
