@@ -94,6 +94,15 @@ def main(argv=None) -> None:
     neuron_campaign.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"],
                                  default="auto")
     neuron_campaign.add_argument("--dry-run", action="store_true")
+    student_surgery = subparsers.add_parser(
+        "student-surgery-study",
+        help="Compare supervised student surgery against matched supervised and KD arms")
+    student_surgery.add_argument("--source", default="runs/cifar10-lt-neuron-campaign")
+    student_surgery.add_argument("--output", default="runs/cifar10-lt-student-surgery")
+    student_surgery.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"],
+                                 default="auto")
+    student_surgery.add_argument("--seeds", type=int, nargs="+", default=[142, 143, 144])
+    student_surgery.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "neuron-surgery-study":
@@ -107,6 +116,11 @@ def main(argv=None) -> None:
             else:
                 report = run_neuron_surgery_study(args.baseline, args.output, args.device,
                                                   tuple(args.seeds), dry_run=args.dry_run)
+        elif args.command == "student-surgery-study":
+            from .student_surgery_study import run_student_surgery_study
+            report = run_student_surgery_study(
+                args.source, args.output, args.device, tuple(args.seeds),
+                dry_run=args.dry_run)
         elif args.command == "neuron-surgery-baselines":
             from .neuron_surgery_baselines import run_neuron_surgery_baselines
             from .neuron_surgery_study import load_neuron_surgery_spec

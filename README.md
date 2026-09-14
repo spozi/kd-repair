@@ -132,6 +132,21 @@ python -m kd neuron-surgery-campaign \
 
 Individual generalized studies use `--study-config configs/neuron_surgery/NAME.json`. Missing matched controls can be generated with `python -m kd neuron-surgery-baselines --study-config ...`.
 
+To compare direct student surgery without distillation against both supervised and KD controls, run:
+
+```bash
+python -m kd student-surgery-study \
+  --source runs/cifar10-lt-neuron-campaign \
+  --output runs/cifar10-lt-student-surgery \
+  --device auto \
+  --seeds 142 143 144
+```
+
+This reuses the completed sealed factor-100 campaign, trains seed-matched supervised students,
+and repairs each one with `CE(target) + CE(preservation)`. It evaluates four arms: supervised,
+direct student surgery, original-teacher KD, and repaired-teacher KD. No teacher logits or feature
+distillation enter the direct student-surgery arm.
+
 ## Run the recommended ablations
 
 ```bash

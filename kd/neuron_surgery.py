@@ -489,16 +489,23 @@ def repair_loss(candidate_target: ModelOutput, target_labels: Tensor,
                 candidate_preservation: ModelOutput, anchor_preservation: ModelOutput,
                 preservation_labels: Tensor, *, temperature: float = 4.0,
                 kd_weight: float = 1.0, feature_weight: float = 0.25,
+                preservation_ce_weight: float = 0.0,
                 feature_stages: tuple[str, ...] | None = None) -> dict[str, Tensor]:
-    if kd_weight < 0 or feature_weight < 0:
+    if kd_weight < 0 or feature_weight < 0 or preservation_ce_weight < 0:
         raise ValueError("Repair preservation weights must be nonnegative")
     ce = F.cross_entropy(candidate_target.logits, target_labels)
-    kd = LogitsKD(temperature)(candidate_preservation.logits, anchor_preservation.logits,
-                               preservation_labels)
-    features = same_model_feature_loss(candidate_preservation.features,
-                                       anchor_preservation.features, feature_stages)
-    return {"total": ce + kd_weight * kd + feature_weight * features, "ce": ce, "kd": kd,
-            "features": features}
+    zero = ce.new_zeros(())
+    preservation_ce = (F.cross_entropy(candidate_preservation.logits, preservation_labels)
+                       if preservation_ce_weight else zero)
+    kd = (LogitsKD(temperature)(candidate_preservation.logits, anchor_preservation.logits,
+                                preservation_labels) if kd_weight else zero)
+    features = (same_model_feature_loss(candidate_preservation.features,
+                                        anchor_preservation.features, feature_stages)
+                if feature_weight else zero)
+    total = (ce + preservation_ce_weight * preservation_ce
+             + kd_weight * kd + feature_weight * features)
+    return {"total": total, "ce": ce, "preservation_ce": preservation_ce,
+            "kd": kd, "features": features}
 
 
 def assert_only_masked_changes(model: nn.Module, before: dict[str, Tensor],
@@ -534,9 +541,10 @@ def train_repair_candidate(candidate: VisionModel, anchor: VisionModel, dataset:
                            batch_size: int = 64, learning_rate: float = 0.001,
                            momentum: float = 0.9, temperature: float = 4.0,
                            kd_weight: float = 1.0, feature_weight: float = 0.25,
+                           preservation_ce_weight: float = 0.0,
                            feature_stages: tuple[str, ...] | None = None,
                            seed: int = 2026) -> tuple[list[dict], dict]:
-    """Fine-tune only selected channel-connected weights under anchor-teacher KD."""
+    """Fine-tune only selected channel-connected weights under preservation losses."""
     if min(epochs, samples_per_epoch, batch_size) < 1:
         raise ValueError("Repair epochs, samples_per_epoch, and batch_size must be positive")
     labels = np.asarray(labels, dtype=np.int64)
@@ -565,7 +573,8 @@ def train_repair_candidate(candidate: VisionModel, anchor: VisionModel, dataset:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         for epoch in range(epochs):
             candidate.eval()
-            totals = {"total": 0.0, "ce": 0.0, "kd": 0.0, "features": 0.0}
+            totals = {"total": 0.0, "ce": 0.0, "preservation_ce": 0.0,
+                      "kd": 0.0, "features": 0.0}
             count = 0
             for (target_images, target_labels), (preserve_images, preserve_labels) in zip(
                     target_loader, preservation_loader):
@@ -573,12 +582,16 @@ def train_repair_candidate(candidate: VisionModel, anchor: VisionModel, dataset:
                 preserve_images, preserve_labels = preserve_images.to(device), preserve_labels.to(device)
                 optimizer.zero_grad(set_to_none=True)
                 target_output = candidate(target_images)
-                preserve_output = candidate(preserve_images, return_features=True)
-                with torch.no_grad():
-                    anchor_output = anchor(preserve_images, return_features=True)
+                preserve_output = candidate(preserve_images, return_features=bool(feature_weight))
+                if kd_weight or feature_weight:
+                    with torch.no_grad():
+                        anchor_output = anchor(preserve_images, return_features=bool(feature_weight))
+                else:
+                    anchor_output = preserve_output
                 losses = repair_loss(target_output, target_labels, preserve_output, anchor_output,
                                      preserve_labels, temperature=temperature,
                                      kd_weight=kd_weight, feature_weight=feature_weight,
+                                     preservation_ce_weight=preservation_ce_weight,
                                      feature_stages=feature_stages)
                 if not torch.isfinite(losses["total"]):
                     raise FloatingPointError("Non-finite neuron-repair loss")

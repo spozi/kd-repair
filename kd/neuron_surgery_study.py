@@ -33,7 +33,7 @@ from .neuron_surgery import (FORMAT_VERSION, TAIL_CLASSES, build_companion_recor
                              train_repair_candidate, validate_repair_provenance)
 
 
-STUDY_VERSION = 2
+STUDY_VERSION = 3
 DEFAULT_SEEDS = (42, 43, 44)
 REPAIR_SEED = 2026
 CHANNEL_BUDGETS = (2, 4, 8)
@@ -67,8 +67,10 @@ class NeuronSurgerySpec:
     stages: tuple[str, ...] | None = None
     score_mode: str = "differential"
     causal_validation: bool = True
+    repair_subject: str = "teacher"
     kd_weight: float = 1.0
     feature_weight: float = 0.25
+    preservation_ce_weight: float = 0.0
     channel_budgets: tuple[int, ...] = CHANNEL_BUDGETS
     learning_rates: tuple[float, ...] = LEARNING_RATES
     repair_epochs: int = 20
@@ -94,6 +96,8 @@ class NeuronSurgerySpec:
             raise ValueError("Confirmation evaluation requires confirmation_fraction > 0")
         if self.score_mode not in {"differential", "gradient_only"}:
             raise ValueError("Study score_mode must be differential or gradient_only")
+        if self.repair_subject not in {"teacher", "student"}:
+            raise ValueError("Study repair_subject must be teacher or student")
         if not isinstance(self.causal_validation, bool) or not isinstance(self.downstream_kd, bool):
             raise ValueError("Study causal_validation and downstream_kd must be booleans")
         if not 0 < self.target_fraction <= 1 or self.companion_count < 1:
@@ -101,7 +105,7 @@ class NeuronSurgerySpec:
         if min(self.training_epochs, self.repair_epochs, self.repair_samples_per_epoch,
                self.repair_batch_size) < 1:
             raise ValueError("Study epoch, sample, and batch counts must be positive")
-        if self.kd_weight < 0 or self.feature_weight < 0:
+        if min(self.kd_weight, self.feature_weight, self.preservation_ce_weight) < 0:
             raise ValueError("Study preservation weights must be nonnegative")
         if (not self.channel_budgets or any(value < 1 for value in self.channel_budgets)
                 or tuple(sorted(set(self.channel_budgets))) != self.channel_budgets):
@@ -221,7 +225,7 @@ def _data_available(config) -> None:
 def _configured_stages(spec: NeuronSurgerySpec) -> tuple[str, ...]:
     if spec.stages is not None:
         return spec.stages
-    if spec.teacher_model == "cifar_teacher":
+    if spec.teacher_model in {"cifar_teacher", "cifar_student"}:
         return ("stage2", "stage3")
     if spec.teacher_model in {"resnet18", "resnet34", "resnet50"}:
         return ("stage3", "stage4")
@@ -253,6 +257,8 @@ def _load_inputs(baseline: str | Path, seeds: tuple[int, ...],
 
     students = {}
     teacher_sha256 = fingerprint(teacher_checkpoint)
+    if not spec.downstream_kd:
+        return baseline, teacher_config, teacher_checkpoint, students
     for seed in seeds:
         run_name = spec.student_run_template.format(seed=seed)
         path = baseline / run_name
@@ -288,7 +294,9 @@ def _protocol(baseline: Path, output: Path, device: str, teacher_config,
     stages = _configured_stages(spec)
     return _json({
         "version": STUDY_VERSION,
-        "method": "AI-Lancet-inspired same-class companion channel repair followed by KD",
+        "method": ("AI-Lancet-inspired same-class companion channel repair followed by KD"
+                   if spec.downstream_kd else
+                   f"AI-Lancet-inspired direct {spec.repair_subject} channel repair"),
         "scope": f"{spec.teacher_model} on factor-{spec.imbalance_factor:g} CIFAR-10-LT",
         "study": spec.to_dict(),
         "baseline": str(baseline), "output": str(output), "device": device,
@@ -320,7 +328,8 @@ def _protocol(baseline: Path, output: Path, device: str, teacher_config,
                    "optimizer": "SGD", "momentum": 0.9, "weight_decay": 0.0,
                    "scheduler": "cosine", "temperature": 4.0,
                    "kd_weight": spec.kd_weight, "feature_weight": spec.feature_weight,
-                   "loss": "CE(target)+weighted KD_T4(anchor,preservation)+weighted late-stage feature preservation"},
+                   "preservation_ce_weight": spec.preservation_ce_weight,
+                   "loss": "CE(target)+weighted CE(preservation)+weighted KD_T4(anchor,preservation)+weighted late-stage feature preservation"},
         "teacher_selection": {"split": "long-tailed validation", "primary": "tail_macro_recall",
                               "overall_accuracy_guardrail": -0.005,
                               "tie_breaks": ["tail_balanced_nll", "fewer_channels", "lower_learning_rate"],
@@ -404,6 +413,7 @@ def _train_candidate(directory: Path, identity: dict, teacher_config, teacher_ch
         device, epochs=spec.repair_epochs, samples_per_epoch=spec.repair_samples_per_epoch,
         batch_size=spec.repair_batch_size, learning_rate=learning_rate, momentum=0.9,
         temperature=4.0, kd_weight=spec.kd_weight, feature_weight=spec.feature_weight,
+        preservation_ce_weight=spec.preservation_ce_weight,
         feature_stages=_configured_stages(spec), seed=REPAIR_SEED)
     validation = _validation_report(candidate, validation_loader, device, classes,
                                     spec.target_classes)
@@ -417,8 +427,10 @@ def _train_candidate(directory: Path, identity: dict, teacher_config, teacher_ch
                              "learning_rate": learning_rate, "repair_seed": REPAIR_SEED,
                              "study_name": spec.name, "score_mode": spec.score_mode,
                              "causal_validation": spec.causal_validation,
+                             "repair_subject": spec.repair_subject,
                              "kd_weight": spec.kd_weight,
                              "feature_weight": spec.feature_weight,
+                             "preservation_ce_weight": spec.preservation_ce_weight,
                              "validation": validation, "verification": verification}}
     save_checkpoint(directory / "teacher.pt", checkpoint)
     result = {"budget": budget, "learning_rate": learning_rate, "channels": channels,
@@ -508,7 +520,7 @@ def _mean_std(values):
 
 
 def _render_report(comparison: dict) -> str:
-    if comparison["status"] == "repair_only_complete":
+    if comparison["status"] in {"repair_only_complete", "student_repair_complete"}:
         delta = comparison["validation_delta"]
         return ("# CIFAR-10-LT neuron-surgery component ablation\n\n"
                 f"Study: **{comparison['study']['name']}**.\n\n"
@@ -767,8 +779,10 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
                     "selection_sha256": fingerprint(directory / "teacher_selection.json")})
 
     if not spec.downstream_kd:
+        direct_student = spec.repair_subject == "student"
         comparison = {
-            "status": "repair_only_complete", "protocol_sha256": protocol_sha256,
+            "status": ("student_repair_complete" if direct_student else "repair_only_complete"),
+            "protocol_sha256": protocol_sha256,
             "study": spec.to_dict(), "teacher_selection": selection,
             "validation_delta": {
                 "accuracy": (selected["validation"]["accuracy"]
@@ -778,7 +792,9 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
                 "tail_balanced_nll": (selected["validation"]["tail_balanced_nll"]
                                       - original_validation["tail_balanced_nll"]),
             },
-            "reason": "Validation-only component ablation; downstream KD and evaluation were predisabled."
+            "reason": ("Direct student repair selected on validation; final evaluation is delegated to the matched comparison."
+                       if direct_student else
+                       "Validation-only component ablation; downstream KD and evaluation were predisabled.")
         }
         write_json(directory / "comparison.json", comparison)
         _freeze_text(directory / "report.md", _render_report(comparison))

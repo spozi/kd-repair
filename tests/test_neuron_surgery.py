@@ -155,6 +155,34 @@ class LocalizationAndMaskTests(unittest.TestCase):
         self.assertAlmostEqual(losses["features"].item(), 0.0, places=6)
         self.assertLess(abs(losses["total"].item() - losses["ce"].item()), 2e-6)
 
+    def test_direct_student_repair_uses_labeled_preservation_without_kd(self):
+        target = ModelOutput(torch.randn(3, 10), {})
+        preservation = ModelOutput(torch.randn(3, 10), {})
+        anchor = ModelOutput(torch.randn(3, 10), {})
+        labels = torch.tensor([0, 1, 2])
+        losses = repair_loss(
+            target, labels, preservation, anchor, labels,
+            kd_weight=0.0, feature_weight=0.0, preservation_ce_weight=1.0)
+        expected = (torch.nn.functional.cross_entropy(target.logits, labels)
+                    + torch.nn.functional.cross_entropy(preservation.logits, labels))
+        torch.testing.assert_close(losses["total"], expected)
+        self.assertEqual(losses["kd"].item(), 0.0)
+        self.assertEqual(losses["features"].item(), 0.0)
+
+    def test_direct_student_masked_step_needs_no_distillation_terms(self):
+        anchor = create_model("cifar_student", 10).eval()
+        candidate = deepcopy(anchor)
+        labels = np.tile(np.arange(10), 2)
+        dataset = TensorDataset(torch.randn(20, 3, 32, 32), torch.tensor(labels))
+        with patch.object(anchor, "forward", side_effect=AssertionError("anchor was used")):
+            _, verification = train_repair_candidate(
+                candidate, anchor, dataset, labels, list(range(10, 20)), list(range(10)),
+                [{"stage": "stage3", "channel": 0}], torch.device("cpu"), epochs=1,
+                samples_per_epoch=10, batch_size=5, learning_rate=0.01,
+                kd_weight=0.0, feature_weight=0.0, preservation_ce_weight=1.0, seed=8)
+        self.assertTrue(verification["all_unselected_coordinates_unchanged"])
+        self.assertTrue(verification["all_buffers_unchanged"])
+
 
 class RepairIntegrationTests(unittest.TestCase):
     def test_repaired_teacher_checkpoint_runs_through_existing_kd_engine(self):
