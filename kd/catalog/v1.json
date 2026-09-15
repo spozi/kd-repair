@@ -133,7 +133,7 @@
       "validation_policy": "deterministic_stratified_80_10_10",
       "license_url": "https://github.com/phelber/EuroSAT",
       "artifacts": [
-        {"id": "rgb", "url": "https://zenodo.org/records/7711810/files/EuroSAT_RGB.zip?download=1", "filename": "EuroSAT_RGB.zip", "md5": "c8fa014336c82ac7804f0398fcb19387", "extract_to": "eurosat"}
+        {"id": "rgb", "url": "https://zenodo.org/records/7711810/files/EuroSAT_RGB.zip?download=1", "filename": "EuroSAT_RGB.zip", "md5": "f46e308c4d50d4bf32fedad2d3d62f3b", "extract_to": "eurosat"}
       ]
     },
     "stl10": {
