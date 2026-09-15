@@ -26,6 +26,10 @@ class DataConfig:
     # 1.0 keeps every class balanced; >1 applies an exponential long-tailed
     # profile to the training and validation splits only.
     imbalance_factor: float = 1.0
+    # Optional versioned dataset-catalog identity. ``balanced`` preserves the
+    # legacy imbalance_factor field; LT profiles are deterministic aliases.
+    dataset_version: str | None = None
+    dataset_profile: str = "balanced"
 
 
 @dataclass(frozen=True)
@@ -165,10 +169,28 @@ class ExperimentConfig:
             raise ValueError("Only classification is supported. Detection/segmentation require task-specific adapters and metrics.")
         if not self.name or self.name in {".", ".."} or Path(self.name).name != self.name:
             raise ValueError("name must be a single directory name")
-        if self.data.source not in {"synthetic", "imagefolder", "cifar10"}:
-            raise ValueError("data.source must be synthetic, imagefolder, or cifar10")
-        if self.data.source == "cifar10" and (self.data.num_classes != 10 or self.data.image_size != 32):
-            raise ValueError("CIFAR-10 requires num_classes=10 and image_size=32")
+        sources = {"synthetic", "imagefolder", "cifar10", "cifar100", "svhn", "cinic10", "gtsrb"}
+        if self.data.source not in sources:
+            raise ValueError(f"data.source must be one of {sorted(sources)}")
+        requirements = {"cifar10": (10, 32), "cifar100": (100, 32),
+                        "svhn": (10, 32), "cinic10": (10, 32), "gtsrb": (43, None)}
+        if self.data.source in requirements:
+            classes, size = requirements[self.data.source]
+            if self.data.num_classes != classes or (size is not None and self.data.image_size != size):
+                if self.data.source == "cifar10":
+                    raise ValueError("CIFAR-10 requires num_classes=10 and image_size=32")
+                raise ValueError(f"{self.data.source} requires num_classes={classes}"
+                                 + (f" and image_size={size}" if size is not None else ""))
+        profiles = {"balanced": 1.0, "lt-if10": 10.0, "lt-if50": 50.0, "lt-if100": 100.0}
+        if self.data.dataset_profile not in profiles:
+            raise ValueError(f"data.dataset_profile must be one of {sorted(profiles)}")
+        if self.data.dataset_profile != "balanced" and self.data.imbalance_factor != 1:
+            raise ValueError("Set either dataset_profile or imbalance_factor, not both")
+        if self.data.dataset_version is not None:
+            if not self.data.dataset_version or Path(self.data.dataset_version).name != self.data.dataset_version:
+                raise ValueError("dataset_version must be a single nonempty path component")
+            if self.data.source in {"synthetic", "imagefolder"}:
+                raise ValueError("dataset_version requires a catalog-backed source")
         if not 0 < self.data.validation_fraction < 1:
             raise ValueError("validation_fraction must be between zero and one")
         if (isinstance(self.data.confirmation_fraction, bool)
@@ -182,8 +204,9 @@ class ExperimentConfig:
         if (isinstance(self.data.imbalance_factor, bool) or not math.isfinite(self.data.imbalance_factor)
                 or self.data.imbalance_factor < 1):
             raise ValueError("data.imbalance_factor must be finite and at least one")
-        if self.data.imbalance_factor > 1 and self.data.source != "cifar10":
-            raise ValueError("Long-tailed sampling is implemented for the cifar10 source only")
+        effective_factor = profiles[self.data.dataset_profile] if self.data.dataset_profile != "balanced" else self.data.imbalance_factor
+        if effective_factor > 1 and self.data.source not in requirements:
+            raise ValueError("Long-tailed sampling is implemented for the cifar10 source only or another catalog-backed source")
         if self.data.augmentation not in {"basic", "strong"}:
             raise ValueError("data.augmentation must be basic or strong")
         for name, value in {
@@ -250,7 +273,14 @@ class ExperimentConfig:
                 raise ValueError(f"{name} must be finite and positive")
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        value = asdict(self)
+        # Keep legacy experiment identities byte-compatible until a catalog
+        # version or named profile is explicitly selected.
+        if self.data.dataset_version is None:
+            value["data"].pop("dataset_version")
+        if self.data.dataset_profile == "balanced":
+            value["data"].pop("dataset_profile")
+        return value
 
 
 def from_dict(raw: dict) -> ExperimentConfig:

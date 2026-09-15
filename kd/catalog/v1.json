@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "catalog_version": "1.0.0",
+  "split_seed": 2026,
+  "storage_limit_bytes": 107374182400,
+  "profiles": ["balanced", "lt-if10", "lt-if50", "lt-if100"],
+  "datasets": {
+    "cifar10": {
+      "version": "1.0",
+      "classes": 10,
+      "image_size": 32,
+      "validation_policy": "stratified_train_10_percent",
+      "license_url": "https://www.cs.toronto.edu/~kriz/cifar.html",
+      "artifacts": [
+        {"id": "python", "url": "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz", "filename": "cifar-10-python.tar.gz", "md5": "c58f30108f718f92721af3b95e74349a", "extract_to": "."}
+      ]
+    },
+    "cifar100": {
+      "version": "1.0",
+      "classes": 100,
+      "image_size": 32,
+      "validation_policy": "stratified_train_10_percent",
+      "license_url": "https://www.cs.toronto.edu/~kriz/cifar.html",
+      "artifacts": [
+        {"id": "python", "url": "https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz", "filename": "cifar-100-python.tar.gz", "md5": "eb9058c3a382ffc7106e4002c42a8d85", "extract_to": "."}
+      ]
+    },
+    "svhn": {
+      "version": "1.0",
+      "classes": 10,
+      "image_size": 32,
+      "validation_policy": "stratified_train_10_percent",
+      "license_url": "http://ufldl.stanford.edu/housenumbers/",
+      "artifacts": [
+        {"id": "train", "url": "http://ufldl.stanford.edu/housenumbers/train_32x32.mat", "filename": "train_32x32.mat", "md5": "e26dedcc434d2e4c54c9b2d4a06d8373"},
+        {"id": "test", "url": "http://ufldl.stanford.edu/housenumbers/test_32x32.mat", "filename": "test_32x32.mat", "md5": "eb5a983be6a315427106f1b164d9cef3"}
+      ]
+    },
+    "cinic10": {
+      "version": "1.0",
+      "classes": 10,
+      "image_size": 32,
+      "validation_policy": "official",
+      "license_url": "https://github.com/BayesWatch/cinic-10",
+      "artifacts": [
+        {"id": "archive", "url": "https://datashare.ed.ac.uk/bitstream/handle/10283/3192/CINIC-10.tar.gz", "filename": "CINIC-10.tar.gz", "md5": "6ee4d0c996905fe93221de577967a372", "extract_to": "."}
+      ]
+    },
+    "gtsrb": {
+      "version": "1.0",
+      "classes": 43,
+      "image_size": 32,
+      "validation_policy": "stratified_train_10_percent",
+      "license_url": "https://benchmark.ini.rub.de/gtsrb_news.html",
+      "artifacts": [
+        {"id": "train", "url": "https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/GTSRB-Training_fixed.zip", "filename": "GTSRB-Training_fixed.zip", "md5": "513f3c79a4c5141765e10e952eaa2478", "extract_to": "gtsrb"},
+        {"id": "test_images", "url": "https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/GTSRB_Final_Test_Images.zip", "filename": "GTSRB_Final_Test_Images.zip", "md5": "c7e4e6327067d32654124b0fe9e82185", "extract_to": "gtsrb"},
+        {"id": "test_labels", "url": "https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/GTSRB_Final_Test_GT.zip", "filename": "GTSRB_Final_Test_GT.zip", "md5": "fe31e9c9270bbcd7b84b7f21a9d9d9e5", "extract_to": "gtsrb"}
+      ]
+    }
+  }
+}

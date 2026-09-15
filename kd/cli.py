@@ -103,9 +103,46 @@ def main(argv=None) -> None:
                                  default="auto")
     student_surgery.add_argument("--seeds", type=int, nargs="+", default=[142, 143, 144])
     student_surgery.add_argument("--dry-run", action="store_true")
+    dataset = subparsers.add_parser("dataset", help="List, fetch, or verify versioned datasets")
+    dataset_commands = dataset.add_subparsers(dest="dataset_command", required=True)
+    dataset_commands.add_parser("list", help="List datasets and profiles in the built-in catalog")
+    for action in ("fetch", "verify"):
+        command = dataset_commands.add_parser(action, help=f"{action.title()} a catalog dataset")
+        command.add_argument("name", choices=["cifar10", "cifar100", "svhn", "cinic10", "gtsrb"])
+        command.add_argument("--version")
+        command.add_argument("--profile", choices=["balanced", "lt-if10", "lt-if50", "lt-if100"],
+                             default="balanced")
+        command.add_argument("--root", default="data")
+    registry_init = dataset_commands.add_parser("registry-init", help="Create an empty private LFS registry")
+    registry_init.add_argument("path")
+    mirror = dataset_commands.add_parser("mirror-manifest", help="Hash cached archives into a mirror manifest")
+    mirror.add_argument("name", choices=["cifar10", "cifar100", "svhn", "cinic10", "gtsrb"])
+    mirror.add_argument("--version")
+    mirror.add_argument("--registry-root", required=True)
+    mirror.add_argument("--terms-reviewed", action="store_true")
+    validate_registry = dataset_commands.add_parser("registry-verify", help="Verify all private mirror objects")
+    validate_registry.add_argument("--registry-root", default=".")
     args = parser.parse_args(argv)
     try:
-        if args.command == "neuron-surgery-study":
+        if args.command == "dataset":
+            from .dataset_registry import (create_mirror_manifest, fetch_dataset,
+                                           initialize_registry, list_datasets,
+                                           validate_registry, verify_dataset)
+            if args.dataset_command == "list":
+                report = list_datasets()
+            elif args.dataset_command == "fetch":
+                report = fetch_dataset(args.name, args.version, args.profile, args.root)
+            elif args.dataset_command == "verify":
+                report = verify_dataset(args.name, args.version, args.profile, args.root)
+            elif args.dataset_command == "registry-init":
+                report = initialize_registry(args.path)
+            elif args.dataset_command == "mirror-manifest":
+                report = create_mirror_manifest(args.name, args.registry_root,
+                                                version=args.version,
+                                                terms_reviewed=args.terms_reviewed)
+            else:
+                report = validate_registry(args.registry_root)
+        elif args.command == "neuron-surgery-study":
             from .neuron_surgery_study import (load_neuron_surgery_spec,
                                                run_neuron_surgery_study)
             if args.study_config:

@@ -1,4 +1,4 @@
-"""Reproducible factor-100 CIFAR-10-LT neuron repair and KD study."""
+"""Reproducible long-tailed image-classification neuron repair and KD study."""
 
 from __future__ import annotations
 
@@ -80,6 +80,10 @@ class NeuronSurgerySpec:
     evaluation_split: str = "test"
     expected_train_counts: tuple[int, ...] | None = EXPECTED_TRAIN_COUNTS
     expected_target_counts: tuple[int, ...] | None = EXPECTED_TARGET_COUNTS
+    dataset_source: str = "cifar10"
+    dataset_num_classes: int = 10
+    dataset_image_size: int = 32
+    dataset_version: str | None = None
 
     def validate(self) -> None:
         if not self.name or Path(self.name).name != self.name:
@@ -114,6 +118,11 @@ class NeuronSurgerySpec:
             raise ValueError("Study learning rates must be positive")
         if not self.target_classes or len(set(self.target_classes)) != len(self.target_classes):
             raise ValueError("Study target classes must be nonempty and unique")
+        if (self.dataset_source not in {"cifar10", "cifar100", "svhn", "cinic10", "gtsrb"}
+                or self.dataset_num_classes < 2 or self.dataset_image_size != 32):
+            raise ValueError("Study dataset must be a supported 32x32 classification source")
+        if any(label < 0 or label >= self.dataset_num_classes for label in self.target_classes):
+            raise ValueError("Study target classes must belong to the configured dataset")
         for template in (self.teacher_run, self.student_run_template.format(seed=self.student_seeds[0])):
             if not template or Path(template).name != template:
                 raise ValueError("Study baseline run names must be single directory names")
@@ -215,11 +224,10 @@ def _stage_npz(path: Path, identity: dict, compute) -> dict[str, np.ndarray]:
 
 def _data_available(config) -> None:
     root = Path(config.data.root)
-    required = [root / "cifar-10-batches-py" / name for name in
-                [*(f"data_batch_{i}" for i in range(1, 6)), "test_batch", "batches.meta"]]
-    missing = [str(path) for path in required if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(f"CIFAR-10 must already be downloaded: {missing}")
+    if config.data.dataset_version is not None:
+        root = root / config.data.source / config.data.dataset_version
+    if not root.exists():
+        raise FileNotFoundError(f"Dataset must already be downloaded: {root}")
 
 
 def _configured_stages(spec: NeuronSurgerySpec) -> tuple[str, ...]:
@@ -245,11 +253,16 @@ def _load_inputs(baseline: str | Path, seeds: tuple[int, ...],
         raise FileNotFoundError(f"Missing repair teacher config or checkpoint: {teacher_directory}")
     teacher_config = from_dict(_read(teacher_config_path))
     teacher_config.validate(require_teacher=False)
-    teacher_recipe = (teacher_config.data.source, teacher_config.data.imbalance_factor,
+    factor = ({"lt-if10": 10.0, "lt-if50": 50.0, "lt-if100": 100.0}
+              .get(teacher_config.data.dataset_profile, teacher_config.data.imbalance_factor))
+    teacher_recipe = (teacher_config.data.source, teacher_config.data.num_classes,
+                      teacher_config.data.image_size, teacher_config.data.dataset_version, factor,
                       teacher_config.data.split_seed, teacher_config.data.confirmation_fraction,
                       teacher_config.student.name, teacher_config.distillation.method,
                       teacher_config.train.seed, teacher_config.train.epochs)
-    expected_teacher = ("cifar10", spec.imbalance_factor, spec.split_seed,
+    expected_teacher = (spec.dataset_source, spec.dataset_num_classes, spec.dataset_image_size,
+                        spec.dataset_version,
+                        spec.imbalance_factor, spec.split_seed,
                         spec.confirmation_fraction, spec.teacher_model, "supervised",
                         spec.teacher_seed, spec.training_epochs)
     if teacher_recipe != expected_teacher or teacher_config.name != spec.teacher_run:
@@ -297,7 +310,8 @@ def _protocol(baseline: Path, output: Path, device: str, teacher_config,
         "method": ("AI-Lancet-inspired same-class companion channel repair followed by KD"
                    if spec.downstream_kd else
                    f"AI-Lancet-inspired direct {spec.repair_subject} channel repair"),
-        "scope": f"{spec.teacher_model} on factor-{spec.imbalance_factor:g} CIFAR-10-LT",
+        "scope": (f"{spec.teacher_model} on factor-{spec.imbalance_factor:g} "
+                  f"{spec.dataset_source}-LT"),
         "study": spec.to_dict(),
         "baseline": str(baseline), "output": str(output), "device": device,
         "teacher": {"config": teacher_config.to_dict(),
@@ -405,9 +419,10 @@ def _train_candidate(directory: Path, identity: dict, teacher_config, teacher_ch
                                    localization_sha256=localization_sha256)
         return cached
     directory.mkdir(parents=True, exist_ok=True)
-    candidate = create_model(spec.teacher_model, 10)
+    candidate = create_model(spec.teacher_model, teacher_config.data.num_classes)
     load_model_checkpoint(candidate, teacher_checkpoint,
-                          metadata(spec.teacher_model, classes, 32, "cifar10"))
+                          metadata(spec.teacher_model, classes, teacher_config.data.image_size,
+                                   teacher_config.data.source))
     history, verification = train_repair_candidate(
         candidate, anchor, dataset, labels, target_indices, preservation_indices, channels,
         device, epochs=spec.repair_epochs, samples_per_epoch=spec.repair_samples_per_epoch,
@@ -417,7 +432,8 @@ def _train_candidate(directory: Path, identity: dict, teacher_config, teacher_ch
         feature_stages=_configured_stages(spec), seed=REPAIR_SEED)
     validation = _validation_report(candidate, validation_loader, device, classes,
                                     spec.target_classes)
-    checkpoint = {**metadata(spec.teacher_model, classes, 32, "cifar10"), "kind": "inference",
+    checkpoint = {**metadata(spec.teacher_model, classes, teacher_config.data.image_size,
+                             teacher_config.data.source), "kind": "inference",
                   "epoch": spec.repair_epochs - 1, "student": candidate.cpu().state_dict(),
                   "repair": {"format_version": FORMAT_VERSION,
                              "base_checkpoint": str(teacher_checkpoint),
@@ -520,19 +536,21 @@ def _mean_std(values):
 
 
 def _render_report(comparison: dict) -> str:
+    dataset = comparison.get("study", {}).get("dataset_source", "cifar10")
+    title = f"# {dataset} long-tailed neuron surgery and KD"
     if comparison["status"] in {"repair_only_complete", "student_repair_complete"}:
         delta = comparison["validation_delta"]
-        return ("# CIFAR-10-LT neuron-surgery component ablation\n\n"
+        return (f"# {dataset} long-tailed neuron-surgery component ablation\n\n"
                 f"Study: **{comparison['study']['name']}**.\n\n"
                 f"Validation accuracy delta: **{delta['accuracy']:+.4f}**.  \n"
                 f"Validation tail-recall delta: **{delta['tail_macro_recall']:+.4f}**.  \n"
                 f"Validation tail-NLL delta: **{delta['tail_balanced_nll']:+.4f}**.\n")
     if comparison["status"] != "complete":
-        return ("# CIFAR-10-LT neuron surgery and KD\n\n"
+        return (title + "\n\n"
                 f"Status: **{comparison['status']}**.\n\n"
                 f"{comparison['reason']}\n")
     aggregate = comparison["aggregate"]
-    lines = ["# CIFAR-10-LT neuron surgery and KD", "",
+    lines = [title, "",
              f"Study: **{comparison['study']['name']}**.", "",
              ("AI-Lancet-inspired channel repair was selected on the long-tailed validation split "
               f"before the {comparison['evaluation_split']} split was loaded."), "",
@@ -595,13 +613,14 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
     if (spec.expected_train_counts is not None
             and tuple(diagnostic_data.provenance["train_per_class"]) != spec.expected_train_counts):
         raise ValueError("Frozen long-tail training counts changed")
-    teacher = create_model(spec.teacher_model, 10)
+    teacher = create_model(spec.teacher_model, teacher_config.data.num_classes)
     stages = _configured_stages(spec)
     if stages != localization_stages(teacher):
         raise ValueError(f"Configured repair stages {stages} do not match model map {localization_stages(teacher)}")
     teacher_state = load_model_checkpoint(
         teacher, teacher_checkpoint,
-        metadata(spec.teacher_model, diagnostic_data.classes, 32, "cifar10"))
+        metadata(spec.teacher_model, diagnostic_data.classes, teacher_config.data.image_size,
+                 teacher_config.data.source))
     if teacher_state.get("epoch", -1) < 0:
         raise ValueError("Repair teacher checkpoint must come from a completed training epoch")
     teacher.to(resolved_device).requires_grad_(False).eval()

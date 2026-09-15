@@ -22,8 +22,11 @@ def baseline_configs(output: str | Path, root: str | Path, device: str,
     spec.validate()
     output = str(Path(output).resolve())
     data = DataConfig(
-        source="cifar10", root=str(Path(root).resolve()), num_classes=10, image_size=32,
-        horizontal_flip=True, validation_fraction=0.1,
+        source=spec.dataset_source, root=str(Path(root).resolve()),
+        num_classes=spec.dataset_num_classes, image_size=spec.dataset_image_size,
+        dataset_version=spec.dataset_version,
+        horizontal_flip=spec.dataset_source in {"cifar10", "cifar100", "cinic10"},
+        validation_fraction=0.1,
         confirmation_fraction=spec.confirmation_fraction, split_seed=spec.split_seed,
         imbalance_factor=spec.imbalance_factor)
     train = TrainConfig(

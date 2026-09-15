@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 
 from .config import DataConfig, TrainConfig
+from .dataset_registry import PROFILES, dataset_directory, dataset_recipe, sha256_value
 
 
 MEAN = (0.485, 0.456, 0.406)
@@ -21,13 +22,20 @@ STD = (0.229, 0.224, 0.225)
 
 def normalization(source: str):
     # Fixed [-1, 1] scaling for CIFAR: no validation/test statistics are fitted.
-    return ((0.5,) * 3, (0.5,) * 3) if source == "cifar10" else (MEAN, STD)
+    fixed = {
+        "cifar10": ((0.5,) * 3, (0.5,) * 3),
+        "cifar100": ((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+        "svhn": ((0.5,) * 3, (0.5,) * 3),
+        "cinic10": ((0.47889522, 0.47227842, 0.43047404),
+                    (0.24205776, 0.23828046, 0.25874835)),
+    }
+    return fixed.get(source, (MEAN, STD))
 
 
 def image_transform(config: DataConfig, *, training: bool):
     size = config.image_size
     mean, std = normalization(config.source)
-    if config.source == "cifar10":
+    if config.source in {"cifar10", "cifar100", "svhn", "cinic10"}:
         operations = [transforms.RandomCrop(32, padding=4)] if training else []
         if training and config.horizontal_flip:
             operations.append(transforms.RandomHorizontalFlip())
@@ -155,11 +163,89 @@ def long_tailed_subset(targets, indices: list[int], factor: float, seed: int) ->
     return sorted(kept)
 
 
+def _effective_factor(data: DataConfig) -> float:
+    return PROFILES[data.dataset_profile] if data.dataset_profile != "balanced" else data.imbalance_factor
+
+
+def _dataset_root(data: DataConfig) -> Path:
+    if data.dataset_version is None:
+        return Path(data.root)
+    return dataset_directory(data.root, data.source, data.dataset_version)
+
+
+def _targets(dataset) -> np.ndarray:
+    if hasattr(dataset, "targets"):
+        return np.asarray(dataset.targets, dtype=np.int64)
+    if hasattr(dataset, "labels"):
+        return np.asarray(dataset.labels, dtype=np.int64)
+    if hasattr(dataset, "_samples"):
+        return np.asarray([label for _, label in dataset._samples], dtype=np.int64)
+    raise TypeError(f"Dataset {type(dataset).__name__} does not expose classification targets")
+
+
+def _native_dataset(source: str, root: Path, split: str, transform, download: bool):
+    if source in {"cifar10", "cifar100"}:
+        cls = datasets.CIFAR10 if source == "cifar10" else datasets.CIFAR100
+        return cls(root, train=split == "train", download=download, transform=transform)
+    if source == "svhn":
+        return datasets.SVHN(root, split=split, download=download, transform=transform)
+    if source == "gtsrb":
+        return datasets.GTSRB(root, split=split, download=download, transform=transform)
+    if source == "cinic10":
+        directory = root / ({"train": "train", "val": "valid", "test": "test"}[split])
+        if not directory.is_dir():
+            raise ValueError(f"Missing CINIC-10 split: {directory}; run `kd dataset fetch cinic10`")
+        return datasets.ImageFolder(directory, transform)
+    raise ValueError(f"No native dataset adapter for {source}")
+
+
+def _catalog_provenance(data: DataConfig) -> dict:
+    if data.dataset_version is None:
+        return {}
+    catalog, recipe = dataset_recipe(data.source, data.dataset_version)
+    marker = _dataset_root(data) / ".kd-dataset.json"
+    result = {"dataset_version": data.dataset_version, "dataset_profile": data.dataset_profile,
+              "catalog_version": catalog["catalog_version"],
+              "catalog_sha256": sha256_value(catalog), "recipe_sha256": sha256_value(recipe)}
+    if marker.is_file():
+        import json
+        prepared = json.loads(marker.read_text())
+        if prepared.get("recipe_sha256") != result["recipe_sha256"]:
+            raise ValueError("Prepared dataset belongs to another catalog recipe")
+        result["artifact_sha256"] = {row["id"]: row["sha256"]
+                                     for row in prepared.get("artifacts", [])}
+    return result
+
+
+def _freeze_split_indices(root: Path, profile: str, train_indices: list[int],
+                          val_indices: list[int]) -> str:
+    directory = root / "splits"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{profile}.npz"
+    train_array = np.asarray(train_indices, dtype="<i8")
+    val_array = np.asarray(val_indices, dtype="<i8")
+    digest = hashlib.sha256(profile.encode("ascii") + train_array.tobytes()
+                            + val_array.tobytes()).hexdigest()
+    if path.exists():
+        with np.load(path, allow_pickle=False) as stored:
+            if (stored["sha256"].item() != digest
+                    or not np.array_equal(stored["train"], train_array)
+                    or not np.array_equal(stored["val"], val_array)):
+                raise ValueError(f"Frozen dataset split changed: {path}")
+    else:
+        temporary = path.with_suffix(".npz.tmp")
+        with temporary.open("wb") as handle:
+            np.savez_compressed(handle, train=train_array, val=val_array,
+                                sha256=np.asarray(digest))
+        temporary.replace(path)
+    return digest
+
+
 def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = True,
                include_confirmation: bool = False, diagnostic: bool = False) -> DataBundle:
     """Build stable splits; diagnostic mode uses canonical transforms and ordering."""
     splits = {}
-    provenance = {"source": data.source}
+    provenance = {"source": data.source, **_catalog_provenance(data)}
     if data.source == "synthetic":
         classes = [f"class_{i}" for i in range(data.num_classes)]
         for i, (split, count) in enumerate((("train", data.train_samples), ("val", data.val_samples),
@@ -169,54 +255,73 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
             splits[split] = SyntheticImages(count, data.num_classes, data.image_size,
                                             train.seed + i * 1_000_000,
                                             image_transform(data, training=split == "train" and not diagnostic))
-    elif data.source == "cifar10":
-        training = datasets.CIFAR10(data.root, train=True, download=data.download,
-                                   transform=image_transform(data, training=not diagnostic))
-        validation = datasets.CIFAR10(data.root, train=True, download=False,
-                                     transform=image_transform(data, training=False))
+    elif data.source in {"cifar10", "cifar100", "svhn", "cinic10", "gtsrb"}:
+        root = _dataset_root(data)
+        training = _native_dataset(data.source, root, "train",
+                                   image_transform(data, training=not diagnostic), data.download)
+        factor = _effective_factor(data)
         confirmation_indices = None
+        if data.source == "cinic10":
+            validation = _native_dataset(data.source, root, "val",
+                                         image_transform(data, training=False), False)
+            train_targets, val_targets = _targets(training), _targets(validation)
+            train_indices, val_indices = list(range(len(training))), list(range(len(validation)))
+            validation_policy = "Official validation split"
+        else:
+            validation = _native_dataset(data.source, root, "train",
+                                         image_transform(data, training=False), False)
+            train_targets = val_targets = _targets(training)
+            validation_policy = "Stratified holdout from official training split"
         if data.confirmation_fraction:
             train_indices, val_indices, confirmation_indices = stratified_confirmation_split(
-                training.targets, data.validation_fraction, data.confirmation_fraction,
+                train_targets, data.validation_fraction, data.confirmation_fraction,
                 data.split_seed)
-        else:
+        elif data.source != "cinic10":
             train_indices, val_indices = stratified_split(
-                training.targets, data.validation_fraction, data.split_seed)
-        if data.imbalance_factor > 1:
+                train_targets, data.validation_fraction, data.split_seed)
+        if factor > 1:
             # Train and validation share the profile: the calibration set is as
             # skewed as training, which is the setting where a single global
             # temperature fitted on validation fails to transfer to a balanced
             # test split. The official test split is never resampled.
-            train_indices = long_tailed_subset(training.targets, train_indices,
-                                               data.imbalance_factor, data.split_seed)
-            val_indices = long_tailed_subset(training.targets, val_indices,
-                                             data.imbalance_factor, data.split_seed + 1)
+            train_indices = long_tailed_subset(train_targets, train_indices, factor, data.split_seed)
+            val_indices = long_tailed_subset(val_targets, val_indices, factor, data.split_seed + 1)
         splits["train"] = Subset(training, train_indices)
         splits["val"] = Subset(validation, val_indices)
         if include_confirmation and confirmation_indices is not None:
-            confirmation = datasets.CIFAR10(data.root, train=True, download=False,
-                                            transform=image_transform(data, training=False))
+            confirmation = _native_dataset(data.source, root, "train",
+                                           image_transform(data, training=False), False)
             splits["confirmation"] = Subset(confirmation, confirmation_indices)
-        classes = training.classes
+        if data.source == "svhn":
+            classes = [str(i) for i in range(10)]
+        elif data.source == "gtsrb":
+            classes = [str(i) for i in range(43)]
+        else:
+            classes = training.classes
         if include_test:
-            splits["test"] = datasets.CIFAR10(data.root, train=False, download=False,
-                                             transform=image_transform(data, training=False))
+            splits["test"] = _native_dataset(data.source, root, "test",
+                                             image_transform(data, training=False), data.download)
         provenance.update(split_seed=data.split_seed, validation_fraction=data.validation_fraction,
                           train_index_sha256=index_hash(train_indices), val_index_sha256=index_hash(val_indices),
-                          train_per_class=np.bincount(np.asarray(training.targets)[train_indices]).tolist(),
-                          val_per_class=np.bincount(np.asarray(training.targets)[val_indices]).tolist(),
+                          train_per_class=np.bincount(train_targets[train_indices], minlength=data.num_classes).tolist(),
+                          val_per_class=np.bincount(val_targets[val_indices], minlength=data.num_classes).tolist(),
                           test_policy="Official test split is loaded only for explicit final evaluation")
-        if data.imbalance_factor > 1:
+        if data.source != "cifar10" or data.dataset_version is not None:
+            provenance["validation_policy"] = validation_policy
+        if factor > 1:
             # Recorded only when imbalanced, so balanced runs keep byte-identical
             # provenance and the completed studies still verify against it.
-            provenance.update(imbalance_factor=data.imbalance_factor,
+            provenance.update(imbalance_factor=factor,
                               imbalance_profile="Exponential over dataset label order; train and validation resampled, test untouched")
+        if data.dataset_version is not None:
+            provenance["split_indices_sha256"] = _freeze_split_indices(
+                root, data.dataset_profile, train_indices, val_indices)
         if confirmation_indices is not None:
             provenance.update(
                 confirmation_fraction=data.confirmation_fraction,
                 confirmation_index_sha256=index_hash(confirmation_indices),
                 confirmation_per_class=np.bincount(
-                    np.asarray(training.targets)[confirmation_indices]).tolist(),
+                    train_targets[confirmation_indices], minlength=data.num_classes).tolist(),
                 confirmation_policy=("Balanced sealed holdout excluded from training, validation, "
                                      "and checkpoint selection"))
     else:
