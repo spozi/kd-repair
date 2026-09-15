@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "catalog_version": "1.0.0",
+  "catalog_version": "1.1.0",
   "split_seed": 2026,
   "storage_limit_bytes": 107374182400,
   "profiles": ["balanced", "lt-if10", "lt-if50", "lt-if100"],
@@ -56,6 +56,94 @@
         {"id": "train", "url": "https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/GTSRB-Training_fixed.zip", "filename": "GTSRB-Training_fixed.zip", "md5": "513f3c79a4c5141765e10e952eaa2478", "extract_to": "gtsrb"},
         {"id": "test_images", "url": "https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/GTSRB_Final_Test_Images.zip", "filename": "GTSRB_Final_Test_Images.zip", "md5": "c7e4e6327067d32654124b0fe9e82185", "extract_to": "gtsrb"},
         {"id": "test_labels", "url": "https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/GTSRB_Final_Test_GT.zip", "filename": "GTSRB_Final_Test_GT.zip", "md5": "fe31e9c9270bbcd7b84b7f21a9d9d9e5", "extract_to": "gtsrb"}
+      ]
+    },
+    "fashionmnist": {
+      "version": "1.0",
+      "classes": 10,
+      "image_size": 32,
+      "validation_policy": "stratified_train_10_percent",
+      "license_url": "https://github.com/zalandoresearch/fashion-mnist/blob/master/LICENSE",
+      "class_names": ["T-shirt/top", "Trouser", "Pullover", "Dress", "Coat", "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot"],
+      "artifacts": [
+        {"id": "train_images", "url": "https://raw.githubusercontent.com/zalandoresearch/fashion-mnist/master/data/fashion/train-images-idx3-ubyte.gz", "filename": "train-images-idx3-ubyte.gz", "md5": "8d4fb7e6c68d591d4c3dfef9ec88bf0d"},
+        {"id": "train_labels", "url": "https://raw.githubusercontent.com/zalandoresearch/fashion-mnist/master/data/fashion/train-labels-idx1-ubyte.gz", "filename": "train-labels-idx1-ubyte.gz", "md5": "25c81989df183df01b3e8a0aad5dffbe"},
+        {"id": "test_images", "url": "https://raw.githubusercontent.com/zalandoresearch/fashion-mnist/master/data/fashion/t10k-images-idx3-ubyte.gz", "filename": "t10k-images-idx3-ubyte.gz", "md5": "bef4ecab320f06d8554ea6380940ec79"},
+        {"id": "test_labels", "url": "https://raw.githubusercontent.com/zalandoresearch/fashion-mnist/master/data/fashion/t10k-labels-idx1-ubyte.gz", "filename": "t10k-labels-idx1-ubyte.gz", "md5": "bb300cfdad3c16e7a12a480ee83cd310"}
+      ]
+    },
+    "pathmnist": {
+      "version": "2.0",
+      "classes": 9,
+      "image_size": 32,
+      "validation_policy": "official",
+      "license_url": "https://zenodo.org/records/10519652",
+      "class_names": ["adipose", "background", "debris", "lymphocytes", "mucus", "smooth muscle", "normal colon mucosa", "cancer-associated stroma", "colorectal adenocarcinoma epithelium"],
+      "artifacts": [
+        {"id": "npz", "url": "https://zenodo.org/records/10519652/files/pathmnist.npz?download=1", "filename": "pathmnist.npz", "md5": "a8b06965200029087d5bd730944a56c1"}
+      ]
+    },
+    "bloodmnist": {
+      "version": "2.0",
+      "classes": 8,
+      "image_size": 32,
+      "validation_policy": "official",
+      "license_url": "https://zenodo.org/records/10519652",
+      "class_names": ["basophil", "eosinophil", "erythroblast", "immature granulocytes", "lymphocyte", "monocyte", "neutrophil", "platelet"],
+      "artifacts": [
+        {"id": "npz", "url": "https://zenodo.org/records/10519652/files/bloodmnist.npz?download=1", "filename": "bloodmnist.npz", "md5": "7053d0359d879ad8a5505303e11de1dc"}
+      ]
+    },
+    "dermamnist": {
+      "version": "2.0",
+      "classes": 7,
+      "image_size": 32,
+      "validation_policy": "official",
+      "license_url": "https://zenodo.org/records/10519652",
+      "class_names": ["actinic keratoses and intraepithelial carcinoma", "basal cell carcinoma", "benign keratosis-like lesions", "dermatofibroma", "melanoma", "melanocytic nevi", "vascular lesions"],
+      "artifacts": [
+        {"id": "npz", "url": "https://zenodo.org/records/10519652/files/dermamnist.npz?download=1", "filename": "dermamnist.npz", "md5": "0744692d530f8e62ec473284d019b0c7"}
+      ]
+    },
+    "organamnist": {
+      "version": "2.0",
+      "classes": 11,
+      "image_size": 32,
+      "validation_policy": "official",
+      "license_url": "https://zenodo.org/records/10519652",
+      "class_names": ["bladder", "femur-left", "femur-right", "heart", "kidney-left", "kidney-right", "liver", "lung-left", "lung-right", "pancreas", "spleen"],
+      "artifacts": [
+        {"id": "npz", "url": "https://zenodo.org/records/10519652/files/organamnist.npz?download=1", "filename": "organamnist.npz", "md5": "68e3f8846a6bd62f0c9bf841c0d9eacc"}
+      ]
+    },
+    "caltech101": {
+      "version": "1.0",
+      "classes": 101,
+      "image_size": 32,
+      "validation_policy": "deterministic_stratified_70_10_20",
+      "license_url": "https://data.caltech.edu/records/mzrjq-6wc02",
+      "artifacts": [
+        {"id": "archive", "url": "https://data.caltech.edu/records/mzrjq-6wc02/files/caltech-101.zip", "filename": "caltech-101.zip", "md5": "3138e1922a9193bfa496528edbbc45d0", "extract_to": ".", "nested_extract": [{"path": "caltech-101/101_ObjectCategories.tar.gz", "extract_to": "."}]}
+      ]
+    },
+    "eurosat": {
+      "version": "1.0",
+      "classes": 10,
+      "image_size": 32,
+      "validation_policy": "deterministic_stratified_80_10_10",
+      "license_url": "https://github.com/phelber/EuroSAT",
+      "artifacts": [
+        {"id": "rgb", "url": "https://zenodo.org/records/7711810/files/EuroSAT_RGB.zip?download=1", "filename": "EuroSAT_RGB.zip", "md5": "c8fa014336c82ac7804f0398fcb19387", "extract_to": "eurosat"}
+      ]
+    },
+    "stl10": {
+      "version": "1.0",
+      "classes": 10,
+      "image_size": 32,
+      "validation_policy": "stratified_train_10_percent",
+      "license_url": "https://ai.stanford.edu/~acoates/stl10/",
+      "artifacts": [
+        {"id": "binary", "url": "https://ai.stanford.edu/~acoates/stl10/stl10_binary.tar.gz", "filename": "stl10_binary.tar.gz", "md5": "91f7769df0f17e558f3565bffb0c7dfb", "extract_to": "."}
       ]
     }
   }

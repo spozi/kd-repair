@@ -11,6 +11,13 @@ from .engine import evaluate_checkpoint, resolve_device, run_experiment, seed_ev
 from .experiments import grid_configs, run_ablation, run_smoke
 
 
+DATASET_CHOICES = [
+    "cifar10", "cifar100", "svhn", "cinic10", "gtsrb", "fashionmnist",
+    "pathmnist", "bloodmnist", "dermamnist", "organamnist", "caltech101",
+    "eurosat", "stl10",
+]
+
+
 def read_config(path: str):
     if Path(path).suffix == ".json":
         return from_dict(json.loads(Path(path).read_text()))
@@ -108,7 +115,7 @@ def main(argv=None) -> None:
     dataset_commands.add_parser("list", help="List datasets and profiles in the built-in catalog")
     for action in ("fetch", "verify"):
         command = dataset_commands.add_parser(action, help=f"{action.title()} a catalog dataset")
-        command.add_argument("name", choices=["cifar10", "cifar100", "svhn", "cinic10", "gtsrb"])
+        command.add_argument("name", choices=DATASET_CHOICES)
         command.add_argument("--version")
         command.add_argument("--profile", choices=["balanced", "lt-if10", "lt-if50", "lt-if100"],
                              default="balanced")
@@ -116,7 +123,7 @@ def main(argv=None) -> None:
     registry_init = dataset_commands.add_parser("registry-init", help="Create an empty private LFS registry")
     registry_init.add_argument("path")
     mirror = dataset_commands.add_parser("mirror-manifest", help="Hash cached archives into a mirror manifest")
-    mirror.add_argument("name", choices=["cifar10", "cifar100", "svhn", "cinic10", "gtsrb"])
+    mirror.add_argument("name", choices=DATASET_CHOICES)
     mirror.add_argument("--version")
     mirror.add_argument("--registry-root", required=True)
     mirror.add_argument("--terms-reviewed", action="store_true")

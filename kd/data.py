@@ -1,10 +1,12 @@
 """One augmentation per image, shared by teacher and student."""
 
 from dataclasses import dataclass, field
+import gzip
 import hashlib
 import math
 from pathlib import Path
 import random
+import struct
 
 import numpy as np
 from PIL import Image
@@ -18,6 +20,13 @@ from .dataset_registry import PROFILES, dataset_directory, dataset_recipe, sha25
 
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
+MEDMNIST_SOURCES = {"pathmnist", "bloodmnist", "dermamnist", "organamnist"}
+OFFICIAL_VALIDATION_SOURCES = {"cinic10", *MEDMNIST_SOURCES}
+PROTOCOL_TEST_FRACTIONS = {"caltech101": 0.2, "eurosat": 0.1}
+CATALOG_SOURCES = {
+    "cifar10", "cifar100", "svhn", "cinic10", "gtsrb", "fashionmnist",
+    *MEDMNIST_SOURCES, "caltech101", "eurosat", "stl10",
+}
 
 
 def normalization(source: str):
@@ -28,6 +37,11 @@ def normalization(source: str):
         "svhn": ((0.5,) * 3, (0.5,) * 3),
         "cinic10": ((0.47889522, 0.47227842, 0.43047404),
                     (0.24205776, 0.23828046, 0.25874835)),
+        "fashionmnist": ((0.2860,) * 3, (0.3530,) * 3),
+        "pathmnist": ((0.5,) * 3, (0.5,) * 3),
+        "bloodmnist": ((0.5,) * 3, (0.5,) * 3),
+        "dermamnist": ((0.5,) * 3, (0.5,) * 3),
+        "organamnist": ((0.5,) * 3, (0.5,) * 3),
     }
     return fixed.get(source, (MEAN, STD))
 
@@ -35,8 +49,12 @@ def normalization(source: str):
 def image_transform(config: DataConfig, *, training: bool):
     size = config.image_size
     mean, std = normalization(config.source)
-    if config.source in {"cifar10", "cifar100", "svhn", "cinic10"}:
-        operations = [transforms.RandomCrop(32, padding=4)] if training else []
+    if config.source in {"cifar10", "cifar100", "svhn", "cinic10", "fashionmnist",
+                         *MEDMNIST_SOURCES}:
+        operations = [] if config.source in {"cifar10", "cifar100", "svhn", "cinic10"} else [
+            transforms.Resize((size, size))]
+        if training:
+            operations.append(transforms.RandomCrop(size, padding=4))
         if training and config.horizontal_flip:
             operations.append(transforms.RandomHorizontalFlip())
         if training and config.augmentation == "strong":
@@ -54,6 +72,50 @@ def image_transform(config: DataConfig, *, training: bool):
     else:
         operations = [transforms.Resize(size + max(2, size // 8)), transforms.CenterCrop(size)]
     return transforms.Compose([*operations, transforms.ToTensor(), transforms.Normalize(mean, std)])
+
+
+class FashionMNISTFiles(Dataset):
+    classes = ["T-shirt/top", "Trouser", "Pullover", "Dress", "Coat", "Sandal",
+               "Shirt", "Sneaker", "Bag", "Ankle boot"]
+
+    def __init__(self, root: Path, train: bool, transform):
+        image_name = "train-images-idx3-ubyte.gz" if train else "t10k-images-idx3-ubyte.gz"
+        label_name = "train-labels-idx1-ubyte.gz" if train else "t10k-labels-idx1-ubyte.gz"
+        with gzip.open(root / image_name, "rb") as handle:
+            magic, count, rows, columns = struct.unpack(">IIII", handle.read(16))
+            if magic != 2051:
+                raise ValueError(f"Invalid Fashion-MNIST image archive: {image_name}")
+            self.data = np.frombuffer(handle.read(), dtype=np.uint8).reshape(count, rows, columns)
+        with gzip.open(root / label_name, "rb") as handle:
+            magic, label_count = struct.unpack(">II", handle.read(8))
+            if magic != 2049 or label_count != count:
+                raise ValueError(f"Invalid Fashion-MNIST label archive: {label_name}")
+            self.targets = np.frombuffer(handle.read(), dtype=np.uint8).astype(np.int64).tolist()
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, index):
+        image = Image.fromarray(self.data[index], mode="L").convert("RGB")
+        return self.transform(image), self.targets[index]
+
+
+class MedMNISTFiles(Dataset):
+    def __init__(self, root: Path, source: str, split: str, transform):
+        _, recipe = dataset_recipe(source)
+        with np.load(root / f"{source}.npz", allow_pickle=False) as payload:
+            self.data = payload[f"{split}_images"]
+            self.targets = payload[f"{split}_labels"].reshape(-1).astype(np.int64).tolist()
+        self.classes = list(recipe["class_names"])
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, index):
+        image = Image.fromarray(self.data[index]).convert("RGB")
+        return self.transform(image), self.targets[index]
 
 
 class SyntheticImages(Dataset):
@@ -106,6 +168,24 @@ def stratified_split(targets, fraction: float, seed: int) -> tuple[list[int], li
         validation.extend(indices[:count].tolist())
         training.extend(indices[count:].tolist())
     return sorted(training), sorted(validation)
+
+
+def stratified_protocol_split(targets, validation_fraction: float, test_fraction: float,
+                              seed: int) -> tuple[list[int], list[int], list[int]]:
+    """Pin train/validation/test partitions for datasets without official splits."""
+    labels = np.asarray(targets)
+    generator = np.random.default_rng(seed)
+    training, validation, test = [], [], []
+    for label in np.unique(labels):
+        indices = generator.permutation(np.flatnonzero(labels == label))
+        val_count = round(len(indices) * validation_fraction)
+        test_count = round(len(indices) * test_fraction)
+        if min(val_count, test_count) < 1 or val_count + test_count >= len(indices):
+            raise ValueError("Each class needs train, validation, and protocol-test examples")
+        validation.extend(indices[:val_count].tolist())
+        test.extend(indices[val_count:val_count + test_count].tolist())
+        training.extend(indices[val_count + test_count:].tolist())
+    return sorted(training), sorted(validation), sorted(test)
 
 
 def stratified_confirmation_split(targets, validation_fraction: float,
@@ -178,6 +258,8 @@ def _targets(dataset) -> np.ndarray:
         return np.asarray(dataset.targets, dtype=np.int64)
     if hasattr(dataset, "labels"):
         return np.asarray(dataset.labels, dtype=np.int64)
+    if hasattr(dataset, "y"):
+        return np.asarray(dataset.y, dtype=np.int64)
     if hasattr(dataset, "_samples"):
         return np.asarray([label for _, label in dataset._samples], dtype=np.int64)
     raise TypeError(f"Dataset {type(dataset).__name__} does not expose classification targets")
@@ -196,6 +278,16 @@ def _native_dataset(source: str, root: Path, split: str, transform, download: bo
         if not directory.is_dir():
             raise ValueError(f"Missing CINIC-10 split: {directory}; run `kd dataset fetch cinic10`")
         return datasets.ImageFolder(directory, transform)
+    if source == "fashionmnist":
+        return FashionMNISTFiles(root, split == "train", transform)
+    if source in MEDMNIST_SOURCES:
+        return MedMNISTFiles(root, source, split, transform)
+    if source == "stl10":
+        return datasets.STL10(root, split=split, download=download, transform=transform)
+    if source == "caltech101":
+        return datasets.Caltech101(root, download=download, transform=transform)
+    if source == "eurosat":
+        return datasets.EuroSAT(root, download=download, transform=transform)
     raise ValueError(f"No native dataset adapter for {source}")
 
 
@@ -255,18 +347,29 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
             splits[split] = SyntheticImages(count, data.num_classes, data.image_size,
                                             train.seed + i * 1_000_000,
                                             image_transform(data, training=split == "train" and not diagnostic))
-    elif data.source in {"cifar10", "cifar100", "svhn", "cinic10", "gtsrb"}:
+    elif data.source in CATALOG_SOURCES:
         root = _dataset_root(data)
         training = _native_dataset(data.source, root, "train",
                                    image_transform(data, training=not diagnostic), data.download)
         factor = _effective_factor(data)
-        confirmation_indices = None
-        if data.source == "cinic10":
+        confirmation_indices = test_indices = None
+        protocol_test = None
+        if data.source in OFFICIAL_VALIDATION_SOURCES:
             validation = _native_dataset(data.source, root, "val",
                                          image_transform(data, training=False), False)
             train_targets, val_targets = _targets(training), _targets(validation)
             train_indices, val_indices = list(range(len(training))), list(range(len(validation)))
             validation_policy = "Official validation split"
+        elif data.source in PROTOCOL_TEST_FRACTIONS:
+            validation = _native_dataset(data.source, root, "train",
+                                         image_transform(data, training=False), False)
+            protocol_test = _native_dataset(data.source, root, "train",
+                                            image_transform(data, training=False), False)
+            train_targets = val_targets = _targets(training)
+            train_indices, val_indices, test_indices = stratified_protocol_split(
+                train_targets, data.validation_fraction, PROTOCOL_TEST_FRACTIONS[data.source],
+                data.split_seed)
+            validation_policy = "Deterministic stratified protocol split; dataset has no official test split"
         else:
             validation = _native_dataset(data.source, root, "train",
                                          image_transform(data, training=False), False)
@@ -276,7 +379,7 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
             train_indices, val_indices, confirmation_indices = stratified_confirmation_split(
                 train_targets, data.validation_fraction, data.confirmation_fraction,
                 data.split_seed)
-        elif data.source != "cinic10":
+        elif data.source not in OFFICIAL_VALIDATION_SOURCES and data.source not in PROTOCOL_TEST_FRACTIONS:
             train_indices, val_indices = stratified_split(
                 train_targets, data.validation_fraction, data.split_seed)
         if factor > 1:
@@ -296,16 +399,27 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
             classes = [str(i) for i in range(10)]
         elif data.source == "gtsrb":
             classes = [str(i) for i in range(43)]
+        elif data.source == "caltech101":
+            classes = training.categories
         else:
             classes = training.classes
         if include_test:
-            splits["test"] = _native_dataset(data.source, root, "test",
-                                             image_transform(data, training=False), data.download)
+            if protocol_test is not None:
+                splits["test"] = Subset(protocol_test, test_indices)
+            else:
+                splits["test"] = _native_dataset(data.source, root, "test",
+                                                 image_transform(data, training=False), data.download)
         provenance.update(split_seed=data.split_seed, validation_fraction=data.validation_fraction,
                           train_index_sha256=index_hash(train_indices), val_index_sha256=index_hash(val_indices),
                           train_per_class=np.bincount(train_targets[train_indices], minlength=data.num_classes).tolist(),
                           val_per_class=np.bincount(val_targets[val_indices], minlength=data.num_classes).tolist(),
                           test_policy="Official test split is loaded only for explicit final evaluation")
+        if test_indices is not None:
+            provenance.update(
+                test_index_sha256=index_hash(test_indices),
+                test_per_class=np.bincount(
+                    train_targets[test_indices], minlength=data.num_classes).tolist(),
+                test_policy="Pinned stratified protocol test split; never resampled by LT profiles")
         if data.source != "cifar10" or data.dataset_version is not None:
             provenance["validation_policy"] = validation_policy
         if factor > 1:

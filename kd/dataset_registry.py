@@ -67,6 +67,13 @@ def load_catalog(path: str | Path | None = None) -> dict:
             required = {"id", "url", "filename", "md5"}
             if not required.issubset(artifact) or Path(artifact["filename"]).name != artifact["filename"]:
                 raise CatalogError(f"Malformed artifact in dataset recipe: {name}")
+            for nested in artifact.get("nested_extract", []):
+                if set(nested) != {"path", "extract_to"}:
+                    raise CatalogError(f"Malformed nested archive in dataset recipe: {name}")
+                for field in ("path", "extract_to"):
+                    path = Path(nested[field])
+                    if path.is_absolute() or ".." in path.parts:
+                        raise CatalogError(f"Unsafe nested archive path in dataset recipe: {name}")
     return catalog
 
 
@@ -114,7 +121,7 @@ def _mirror_files(root: Path, name: str, recipe: dict) -> dict[str, Path]:
     if not registry:
         return {}
     checkout = _registry_checkout(root, registry,
-                                  os.environ.get("KD_DATASET_REGISTRY_REF", "catalog-v1.0.0"))
+                                  os.environ.get("KD_DATASET_REGISTRY_REF", "catalog-v1.2.0"))
     manifest_path = checkout / "manifests" / name / f"{recipe['version']}.json"
     try:
         manifest = json.loads(manifest_path.read_text())
@@ -207,7 +214,10 @@ def fetch_dataset(name: str, version: str | None = None, profile: str = "balance
             destination.unlink(missing_ok=True)
             raise CatalogError(f"Checksum mismatch for {name}/{artifact['id']}")
         if artifact.get("extract_to") is not None:
-            _safe_extract(destination, target / artifact["extract_to"])
+            extracted_root = target / artifact["extract_to"]
+            _safe_extract(destination, extracted_root)
+            for nested in artifact.get("nested_extract", []):
+                _safe_extract(extracted_root / nested["path"], target / nested["extract_to"])
         artifacts.append({"id": artifact["id"], "filename": artifact["filename"],
                           "size": destination.stat().st_size,
                           "sha256": file_hash(destination), "source": source})
@@ -286,7 +296,7 @@ def initialize_registry(path: str | Path) -> dict:
         "        with:\n"
         "          lfs: true\n"
         "      - run: git lfs fsck\n"
-        "      - run: git clone --depth 1 --branch source-v0.2.0 https://github.com/spozi/kd-repair.git /tmp/kd-repair\n"
+        "      - run: git clone --depth 1 --branch source-v0.3.0 https://github.com/spozi/kd-repair.git /tmp/kd-repair\n"
         "      - run: python -m pip install -e /tmp/kd-repair --no-deps\n"
         "      - run: python -m kd dataset registry-verify --registry-root .\n")
     return {"initialized": True, "root": str(root), "storage_limit_bytes": load_catalog()["storage_limit_bytes"]}

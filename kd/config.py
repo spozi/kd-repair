@@ -169,11 +169,17 @@ class ExperimentConfig:
             raise ValueError("Only classification is supported. Detection/segmentation require task-specific adapters and metrics.")
         if not self.name or self.name in {".", ".."} or Path(self.name).name != self.name:
             raise ValueError("name must be a single directory name")
-        sources = {"synthetic", "imagefolder", "cifar10", "cifar100", "svhn", "cinic10", "gtsrb"}
+        sources = {"synthetic", "imagefolder", "cifar10", "cifar100", "svhn", "cinic10",
+                   "gtsrb", "fashionmnist", "pathmnist", "bloodmnist", "dermamnist",
+                   "organamnist", "caltech101", "eurosat", "stl10"}
         if self.data.source not in sources:
             raise ValueError(f"data.source must be one of {sorted(sources)}")
         requirements = {"cifar10": (10, 32), "cifar100": (100, 32),
-                        "svhn": (10, 32), "cinic10": (10, 32), "gtsrb": (43, None)}
+                        "svhn": (10, 32), "cinic10": (10, 32), "gtsrb": (43, None),
+                        "fashionmnist": (10, 32), "pathmnist": (9, 32),
+                        "bloodmnist": (8, 32), "dermamnist": (7, 32),
+                        "organamnist": (11, 32), "caltech101": (101, 32),
+                        "eurosat": (10, 32), "stl10": (10, 32)}
         if self.data.source in requirements:
             classes, size = requirements[self.data.source]
             if self.data.num_classes != classes or (size is not None and self.data.image_size != size):
