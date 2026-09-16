@@ -190,9 +190,14 @@ balanced, IF10, IF50, and IF100 profiles on four GPUs:
 scripts/run_gpu_experiment1_4gpu.sh --gpu-ids 0,1,2,3
 ```
 
-The launcher freezes a 20-job plan, prepares each dataset once, dynamically
-schedules isolated jobs, resumes validated artifacts, and writes a matrix-level
-summary without pooling samples across datasets.
+The launcher provisions its own environment, freezes a 20-job plan, prepares each
+matrix dataset once, dynamically schedules isolated jobs, resumes validated
+artifacts, and writes a matrix-level summary without pooling samples across
+datasets. It uses an activated virtualenv when one is present, otherwise creates
+the Conda environment (or a local `.venv`) and installs dependencies itself.
+Dataset downloads, Git LFS transfers, and package installs stream live byte
+progress, and the queue prints a per-GPU status table every 30 seconds
+(`--status-interval`, or `--stream-logs` to mirror worker output inline).
 
 To compare direct student surgery without distillation against both supervised and KD controls, run:
 
