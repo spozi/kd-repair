@@ -137,7 +137,7 @@ Unavailable classes are omitted from the causal preservation sample, and that
 coverage is recorded in `targets.json`. The fixed CIFAR-10 protocol keeps this
 fallback disabled.
 
-Generate the immutable 20-job plan and run it on four GPUs with:
+Generate the immutable 20-job plan and run it across the available GPUs with:
 
 ```bash
 python -m kd neuron-surgery-matrix-plan \
