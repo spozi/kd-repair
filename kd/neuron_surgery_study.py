@@ -20,7 +20,7 @@ from .calibration_metrics import extended_prediction_metrics
 from .checkpoints import (fingerprint, load_model_checkpoint, metadata, save_checkpoint,
                           write_json)
 from .config import SurgeryConfig, from_dict
-from .data import build_data
+from .data import CATALOG_SOURCES, build_data
 from .engine import resolve_device, run_experiment, seed_everything
 from .evaluation import (collect_predictions, paired_calibration_comparison,
                          paired_comparison, prediction_metrics)
@@ -131,7 +131,7 @@ class NeuronSurgerySpec:
             raise ValueError("Derived target class policies require target_classes=null")
         if self.target_class_policy == "frequency_tail" and self.imbalance_factor == 1:
             raise ValueError("frequency_tail requires an imbalanced dataset profile")
-        if (self.dataset_source not in {"cifar10", "cifar100", "svhn", "cinic10", "gtsrb"}
+        if (self.dataset_source not in CATALOG_SOURCES
                 or self.dataset_num_classes < 2 or self.dataset_image_size != 32):
             raise ValueError("Study dataset must be a supported 32x32 classification source")
         if (self.target_classes is not None

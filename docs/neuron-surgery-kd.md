@@ -122,8 +122,10 @@ See [the campaign protocol](neuron-surgery-campaign.md) for the fixed matrix.
 
 ### Multi-dataset matrix
 
-The matrix protocol covers CIFAR-10, CIFAR-100, SVHN, CINIC-10, and GTSRB at
-balanced, IF10, IF50, and IF100 profiles. Catalog profile identity is part of
+The matrix protocol covers all 13 catalog datasets: CIFAR-10, CIFAR-100, SVHN,
+CINIC-10, GTSRB, Fashion-MNIST, PathMNIST, BloodMNIST, DermaMNIST, OrganAMNIST,
+Caltech-101, EuroSAT, and STL-10. Each runs at balanced, IF10, IF50, and IF100
+profiles. Catalog profile identity is part of
 the frozen baseline and study protocols. Balanced studies target every class;
 long-tailed studies deterministically target the lowest-frequency half of the
 classes, with class-index tie breaking. The resolved classes and training counts
@@ -137,11 +139,11 @@ Unavailable classes are omitted from the causal preservation sample, and that
 coverage is recorded in `targets.json`. The fixed CIFAR-10 protocol keeps this
 fallback disabled.
 
-Generate the immutable 20-job plan and run it across the available GPUs with:
+Generate the immutable 52-job plan and run it across the available GPUs with:
 
 ```bash
 python -m kd neuron-surgery-matrix-plan \
-  --output runs/experiment1-multidataset/matrix-plan
+  --output runs/experiment1-all-datasets/matrix-plan
 scripts/run_gpu_experiment1_4gpu.sh --gpu-ids 0,1,2,3
 ```
 

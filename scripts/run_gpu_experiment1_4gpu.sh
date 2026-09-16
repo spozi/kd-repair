@@ -14,7 +14,7 @@ CONDA_ENV="${CONDA_ENV:-kd}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu132}"
 DATA_ROOT="${DATA_ROOT:-data}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-runs/experiment1-multidataset}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-runs/experiment1-all-datasets}"
 REGISTRY_URL="${KD_DATASET_REGISTRY:-https://gitea.izzus.dev/syafiq/kd-repair.git}"
 REGISTRY_REF="${KD_DATASET_REGISTRY_REF:-catalog-v1.2.0}"
 GPU_IDS_SET=0
@@ -22,7 +22,7 @@ if [[ -n "${GPU_IDS+x}" ]]; then
   GPU_IDS_SET=1
 fi
 GPU_IDS_CSV="${GPU_IDS:-0,1,2,3}"
-DATASETS_CSV="${EXPERIMENT_DATASETS:-cinic10,svhn,cifar100,cifar10,gtsrb}"
+DATASETS_CSV="${EXPERIMENT_DATASETS:-cinic10,pathmnist,svhn,fashionmnist,organamnist,cifar100,cifar10,gtsrb,eurosat,bloodmnist,caltech101,dermamnist,stl10}"
 PROFILES_CSV="${EXPERIMENT_PROFILES:-balanced,lt-if10,lt-if50,lt-if100}"
 STATUS_INTERVAL="${STATUS_INTERVAL:-30}"
 
@@ -61,7 +61,7 @@ Options:
   --force-bootstrap     Reinstall dependencies even when they are already importable
   --data-root PATH      Dataset directory (default: data)
   --output-root PATH    Root for plans and isolated study outputs
-  --registry-url URL    Private dataset-registry SSH URL
+  --registry-url URL    Dataset-registry Git URL (HTTPS or SSH)
   --registry-ref REF    Immutable dataset catalog tag
   --skip-fetch          Reuse already prepared local datasets
   --fetch-all-datasets  Prepare the whole catalog, not just the matrix datasets
@@ -77,10 +77,9 @@ Conda environment is created when Conda is available, and otherwise a local
 .venv is created. Dependencies install only when missing; pass --force-bootstrap
 to reinstall.
 
-Default matrix: CIFAR-10, CIFAR-100, SVHN, CINIC-10, and GTSRB, each with
-balanced, IF10, IF50, and IF100 profiles (20 studies). The queue keeps one
-worker busy per GPU and resumes validated artifacts when rerun with the same
-output.
+Default matrix: all 13 catalog datasets, each with balanced, IF10, IF50, and
+IF100 profiles (52 studies). The queue keeps one worker busy per GPU and
+resumes validated artifacts when rerun with the same output.
 EOF
 }
 
@@ -358,7 +357,6 @@ log_stage 'Verifying prepared datasets'
 for dataset in "${DATASETS_ARRAY[@]}"; do
   for profile in "${PROFILES_ARRAY[@]}"; do
     "$PYTHON_BIN" -m kd dataset verify "$dataset" \
-      --version 1.0 \
       --profile "$profile" \
       --root "$DATA_ROOT"
   done

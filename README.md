@@ -183,14 +183,17 @@ python -m kd neuron-surgery-campaign \
 
 Individual generalized studies use `--study-config configs/neuron_surgery/NAME.json`. Missing matched controls can be generated with `python -m kd neuron-surgery-baselines --study-config ...`.
 
-To run Experiment 1 across CIFAR-10, CIFAR-100, SVHN, CINIC-10, and GTSRB at
-balanced, IF10, IF50, and IF100 profiles across every detected GPU:
+To run Experiment 1 across all 13 catalog datasets at balanced, IF10, IF50,
+and IF100 profiles across every detected GPU:
 
 ```bash
 scripts/run_gpu_experiment1_4gpu.sh --gpu-ids 0,1,2,3
 ```
 
-The launcher provisions its own environment, freezes a 20-job plan, prepares each
+The default catalog includes CIFAR-10, CIFAR-100, SVHN, CINIC-10, GTSRB,
+Fashion-MNIST, PathMNIST, BloodMNIST, DermaMNIST, OrganAMNIST, Caltech-101,
+EuroSAT, and STL-10. The launcher provisions its own environment, freezes a
+52-job plan, prepares each
 matrix dataset once, dynamically schedules isolated jobs, resumes validated
 artifacts, and writes a matrix-level summary without pooling samples across
 datasets. It uses an activated virtualenv when one is present, otherwise creates

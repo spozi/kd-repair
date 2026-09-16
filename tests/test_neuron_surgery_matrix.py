@@ -82,10 +82,12 @@ class SparseClassFallbackTests(unittest.TestCase):
 class MatrixPlanTests(unittest.TestCase):
     def test_default_matrix_has_every_dataset_profile_pair(self):
         jobs = matrix_jobs()
-        self.assertEqual(len(jobs), 20)
-        self.assertEqual(len({job["id"] for job in jobs}), 20)
+        self.assertEqual(len(jobs), 52)
+        self.assertEqual(len({job["id"] for job in jobs}), 52)
         self.assertEqual({job["dataset"] for job in jobs},
-                         {"cifar10", "cifar100", "svhn", "cinic10", "gtsrb"})
+                         {"cifar10", "cifar100", "svhn", "cinic10", "gtsrb",
+                          "fashionmnist", "pathmnist", "bloodmnist", "dermamnist",
+                          "organamnist", "caltech101", "eurosat", "stl10"})
         self.assertEqual({job["profile"] for job in jobs},
                          {"balanced", "lt-if10", "lt-if50", "lt-if100"})
 
@@ -96,6 +98,19 @@ class MatrixPlanTests(unittest.TestCase):
         self.assertEqual(teacher.data.imbalance_factor, 1.0)
         self.assertEqual(teacher.data.num_classes, 100)
         self.assertEqual(len(students), 3)
+
+    def test_every_catalog_job_builds_a_valid_baseline_recipe(self):
+        for job in matrix_jobs():
+            with self.subTest(job=job["id"]):
+                spec = matrix_spec(job["dataset"], job["profile"])
+                teacher, students = baseline_configs("runs/example", "data", "cpu", spec)
+                teacher.validate(require_teacher=False)
+                for student in students:
+                    student.validate()
+
+    def test_catalog_versions_are_not_assumed_to_be_one(self):
+        self.assertEqual(matrix_spec("pathmnist", "balanced").dataset_version, "2.0")
+        self.assertEqual(matrix_spec("cifar10", "balanced").dataset_version, "1.0")
 
     def test_plan_is_idempotent_and_configs_round_trip(self):
         with tempfile.TemporaryDirectory() as root:

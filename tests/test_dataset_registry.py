@@ -310,6 +310,24 @@ class CatalogDataTests(unittest.TestCase):
                               len(bundle.test.dataset)), (90, 18, 9))
             self.assertEqual(bundle.provenance["validation_policy"], "Official validation split")
 
+    def test_long_tailed_profile_keeps_rare_classes_in_small_official_splits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {}
+            for split, per_class in (("train", 10), ("val", 2), ("test", 1)):
+                payload[f"{split}_images"] = np.zeros(
+                    (9 * per_class, 28, 28, 3), dtype=np.uint8)
+                payload[f"{split}_labels"] = np.repeat(np.arange(9), per_class)[:, None]
+            np.savez_compressed(root / "pathmnist.npz", **payload)
+            bundle = build_data(
+                DataConfig(source="pathmnist", root=str(root), num_classes=9,
+                           image_size=32, dataset_profile="lt-if100"),
+                TrainConfig())
+            self.assertTrue(all(count >= 1 for count in bundle.provenance["train_per_class"]))
+            self.assertTrue(all(count >= 1 for count in bundle.provenance["val_per_class"]))
+            self.assertEqual(len(bundle.test.dataset), 9)
+            self.assertEqual(bundle.provenance["imbalance_minimum_per_class"], 1)
+
     def test_caltech_protocol_split_is_deterministic_and_disjoint(self):
         config = DataConfig(source="caltech101", num_classes=101, image_size=32)
         with patch("kd.data.datasets.Caltech101", FakeCaltech101):

@@ -63,16 +63,17 @@ rerun with the same arguments to resume validated artifacts. Run
 `scripts/run_gpu_experiment1.sh --help` for dry-run, stage-only, path, and registry overrides. Install
 a CUDA-enabled PyTorch build in the active environment before invoking it.
 
-For a multi-GPU server, run the complete five-dataset matrix:
+For a multi-GPU server, run the complete 13-dataset matrix:
 
 ```bash
 scripts/run_gpu_experiment1_4gpu.sh --gpu-ids 0,1,2,3
 ```
 
-The default matrix contains CIFAR-10, CIFAR-100, SVHN, CINIC-10, and GTSRB under balanced, IF10,
-IF50, and IF100 profiles. Shared dataset preparation, CUDA checks, and tests run once. A dynamic queue
+The default matrix contains CIFAR-10, CIFAR-100, SVHN, CINIC-10, GTSRB, Fashion-MNIST,
+PathMNIST, BloodMNIST, DermaMNIST, OrganAMNIST, Caltech-101, EuroSAT, and STL-10 under balanced,
+IF10, IF50, and IF100 profiles (52 studies). Shared dataset preparation, CUDA checks, and tests run once. A dynamic queue
 keeps one isolated worker per GPU active, starts the next study when a GPU becomes free, and writes a
-dataset/profile report under `runs/experiment1-multidataset/`. Use `--datasets` or `--profiles` for a
+dataset/profile report under `runs/experiment1-all-datasets/`. Use `--datasets` or `--profiles` for a
 smaller matrix. Every job can resume independently.
 
 The launcher provisions Python itself: an activated virtualenv is reused as-is, otherwise it creates

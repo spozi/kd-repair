@@ -6,16 +6,22 @@ import json
 from pathlib import Path
 
 from .checkpoints import fingerprint, write_json
+from .dataset_registry import load_catalog
 from .neuron_surgery_study import NeuronSurgerySpec
 
 
-MATRIX_VERSION = 1
+MATRIX_VERSION = 2
+DATASET_ORDER = (
+    "cinic10", "pathmnist", "svhn", "fashionmnist", "organamnist", "cifar100",
+    "cifar10", "gtsrb", "eurosat", "bloodmnist", "caltech101", "dermamnist",
+    "stl10",
+)
+_CATALOG = load_catalog()
 DATASETS = {
-    "cinic10": {"version": "1.0", "classes": 10},
-    "svhn": {"version": "1.0", "classes": 10},
-    "cifar100": {"version": "1.0", "classes": 100},
-    "cifar10": {"version": "1.0", "classes": 10},
-    "gtsrb": {"version": "1.0", "classes": 43},
+    name: {"version": _CATALOG["datasets"][name]["version"],
+           "classes": _CATALOG["datasets"][name]["classes"],
+           "image_size": _CATALOG["datasets"][name]["image_size"]}
+    for name in DATASET_ORDER
 }
 PROFILES = {
     "balanced": {"factor": 1.0, "epochs": 81, "target_policy": "all"},
@@ -48,7 +54,7 @@ def matrix_spec(dataset: str, profile: str) -> NeuronSurgerySpec:
         expected_target_counts=None,
         dataset_source=dataset,
         dataset_num_classes=data["classes"],
-        dataset_image_size=32,
+        dataset_image_size=data["image_size"],
         dataset_version=data["version"],
         dataset_profile=profile,
         allow_sparse_class_fallback=True,
@@ -87,6 +93,7 @@ def materialize_matrix_plan(output: str | Path, datasets=None, profiles=None) ->
     protocol = {
         "version": MATRIX_VERSION,
         "purpose": "Experiment 1 multi-dataset neuron repair and KD matrix",
+        "catalog_version": _CATALOG["catalog_version"],
         "datasets": list(DATASETS if datasets is None else datasets),
         "profiles": list(PROFILES if profiles is None else profiles),
         "jobs": jobs,

@@ -215,8 +215,9 @@ def index_hash(indices: list[int]) -> str:
 def long_tailed_subset(targets, indices: list[int], factor: float, seed: int) -> list[int]:
     """Exponential class-imbalance profile over an existing index list.
 
-    Class k keeps `round(n_k * factor ** (-k / (K - 1)))` of its examples, so the
-    first class keeps all of them and the last keeps roughly `1 / factor` of them.
+    Class k keeps `max(1, round(n_k * factor ** (-k / (K - 1))))` examples, so
+    the first class keeps all of them and every class remains represented even
+    when a small validation split cannot realize the requested factor exactly.
     Class order is the dataset's own label order, not a difficulty ranking.
 
     A factor of exactly one returns the input unchanged, so balanced studies keep
@@ -237,9 +238,7 @@ def long_tailed_subset(targets, indices: list[int], factor: float, seed: int) ->
         available = np.asarray(indices, dtype=np.int64)
         available = available[labels[available] == label]
         share = factor ** (-position / (len(present) - 1))
-        count = int(round(len(available) * share))
-        if count < 1:
-            raise ValueError(f"Imbalance factor {factor} leaves class {label} empty; lower it")
+        count = max(1, int(round(len(available) * share)))
         kept.extend(generator.permutation(available)[:count].tolist())
     return sorted(kept)
 
@@ -426,8 +425,11 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
         if factor > 1:
             # Recorded only when imbalanced, so balanced runs keep byte-identical
             # provenance and the completed studies still verify against it.
-            provenance.update(imbalance_factor=factor,
-                              imbalance_profile="Exponential over dataset label order; train and validation resampled, test untouched")
+            provenance.update(
+                imbalance_factor=factor,
+                imbalance_profile=("Exponential over dataset label order with a one-example "
+                                   "per-class floor; train and validation resampled, test untouched"),
+                imbalance_minimum_per_class=1)
         if data.dataset_version is not None:
             provenance["split_indices_sha256"] = _freeze_split_indices(
                 root, data.dataset_profile, train_indices, val_indices)
