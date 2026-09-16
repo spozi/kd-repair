@@ -122,6 +122,15 @@ def main(argv=None) -> None:
         command.add_argument("--root", default="data")
     registry_init = dataset_commands.add_parser("registry-init", help="Create an empty private LFS registry")
     registry_init.add_argument("path")
+    registry_config = dataset_commands.add_parser(
+        "registry-config", help="Persist private registry settings for automatic dataset fetches")
+    registry_config.add_argument("--url")
+    registry_config.add_argument("--ref", default="catalog-v1.2.0")
+    registry_config.add_argument("--path", help="Override the per-user configuration path")
+    registry_config.add_argument("--remove", action="store_true")
+    registry_status_command = dataset_commands.add_parser(
+        "registry-status", help="Show the effective private registry configuration")
+    registry_status_command.add_argument("--path", help="Override the per-user configuration path")
     mirror = dataset_commands.add_parser("mirror-manifest", help="Hash cached archives into a mirror manifest")
     mirror.add_argument("name", choices=DATASET_CHOICES)
     mirror.add_argument("--version")
@@ -132,9 +141,9 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
     try:
         if args.command == "dataset":
-            from .dataset_registry import (create_mirror_manifest, fetch_dataset,
-                                           initialize_registry, list_datasets,
-                                           validate_registry, verify_dataset)
+            from .dataset_registry import (configure_registry, create_mirror_manifest,
+                                           fetch_dataset, initialize_registry, list_datasets,
+                                           registry_status, validate_registry, verify_dataset)
             if args.dataset_command == "list":
                 report = list_datasets()
             elif args.dataset_command == "fetch":
@@ -143,6 +152,11 @@ def main(argv=None) -> None:
                 report = verify_dataset(args.name, args.version, args.profile, args.root)
             elif args.dataset_command == "registry-init":
                 report = initialize_registry(args.path)
+            elif args.dataset_command == "registry-config":
+                report = configure_registry(args.url, args.ref, path=args.path,
+                                            remove=args.remove)
+            elif args.dataset_command == "registry-status":
+                report = registry_status(args.path)
             elif args.dataset_command == "mirror-manifest":
                 report = create_mirror_manifest(args.name, args.registry_root,
                                                 version=args.version,

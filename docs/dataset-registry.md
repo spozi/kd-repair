@@ -44,17 +44,31 @@ git lfs fsck
 Commit the LFS pointers, manifests, and workflow, push `main`, and create the immutable annotated
 tag `catalog-v1.0.0`. Do not move or replace a published catalog tag.
 
-## Fetch for an experiment
+## Configure a machine once
 
-Configure the mirror only in the local shell:
+After cloning the public source on a new machine, persist the private registry location in the
+user configuration directory. The file is written atomically with mode `0600` and contains no
+credential:
 
 ```bash
-export KD_DATASET_REGISTRY=ssh://git@gitea.izzus.dev:2222/syafiq/kd-repair.git
-export KD_DATASET_REGISTRY_REF=catalog-v1.0.0
+python -m kd dataset registry-config \
+  --url ssh://git@gitea.izzus.dev:2222/syafiq/kd-repair.git \
+  --ref catalog-v1.2.0
+python -m kd dataset registry-status
+```
+
+Future fetches automatically use this setting:
+
+```bash
 python -m kd dataset list
 python -m kd dataset fetch cifar100 --version 1.0 --profile lt-if100 --root data
 python -m kd dataset verify cifar100 --version 1.0 --profile lt-if100 --root data
 ```
+
+The default configuration path is `$XDG_CONFIG_HOME/kd-repair/datasets.json`, or
+`~/.config/kd-repair/datasets.json` when `XDG_CONFIG_HOME` is unset. Environment variables
+`KD_DATASET_REGISTRY` and `KD_DATASET_REGISTRY_REF` remain higher-priority temporary overrides.
+Use `python -m kd dataset registry-config --remove` to remove the persisted setting.
 
 The fetcher clones with LFS smudging disabled and pulls only paths named by the selected mirror
 manifest. If the private mirror is unavailable, it downloads from upstream and records the fallback
@@ -62,8 +76,10 @@ reason without exposing credentials. Official test data are never long-tail resa
 
 ## Catalog protocol
 
-Version 1 includes CIFAR-10, CIFAR-100, SVHN train/test, CINIC-10, and GTSRB. Profiles are
-`balanced`, `lt-if10`, `lt-if50`, and `lt-if100`, all using split seed 2026. CIFAR, SVHN, and GTSRB
-use a stratified 10 percent validation holdout; CINIC-10 retains its official validation split.
+The current catalog includes CIFAR-10, CIFAR-100, SVHN, CINIC-10, GTSRB, Fashion-MNIST,
+PathMNIST, BloodMNIST, DermaMNIST, OrganAMNIST, Caltech-101, EuroSAT, and STL-10. Profiles are
+`balanced`, `lt-if10`, `lt-if50`, and `lt-if100`, all using split seed 2026. Official validation
+and test splits are preserved. Caltech-101 and EuroSAT use pinned stratified protocol splits because
+their archives do not provide official test partitions.
 The registry validator rejects malformed manifests, altered objects, unsafe paths, unreviewed terms,
 and total mirrored storage above 100 GiB.

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 import zipfile
 import re
@@ -18,6 +19,8 @@ import re
 CATALOG_PATH = Path(__file__).with_name("catalog") / "v1.json"
 PROFILES = {"balanced": 1.0, "lt-if10": 10.0, "lt-if50": 50.0, "lt-if100": 100.0}
 MARKER = ".kd-dataset.json"
+DEFAULT_REGISTRY_REF = "catalog-v1.2.0"
+REGISTRY_CONFIG_ENV = "KD_DATASET_REGISTRY_CONFIG"
 
 
 class CatalogError(ValueError):
@@ -26,6 +29,73 @@ class CatalogError(ValueError):
 
 class RegistryUnavailable(RuntimeError):
     pass
+
+
+def registry_config_path(path: str | Path | None = None) -> Path:
+    if path is not None:
+        return Path(path).expanduser()
+    override = os.environ.get(REGISTRY_CONFIG_ENV)
+    if override:
+        return Path(override).expanduser()
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "kd-repair" / "datasets.json"
+
+
+def _validate_registry_settings(registry: str, ref: str) -> None:
+    if not registry or not isinstance(registry, str):
+        raise CatalogError("Dataset registry URL must be a nonempty string")
+    if not isinstance(ref, str) or not re.fullmatch(r"catalog-v\d+\.\d+\.\d+", ref):
+        raise CatalogError("Private registry ref must be an immutable catalog tag")
+    if "://" in registry:
+        parsed = urlsplit(registry)
+        if not parsed.scheme or not parsed.hostname:
+            raise CatalogError("Dataset registry URL is malformed")
+        if parsed.password or (parsed.scheme in {"http", "https"} and parsed.username):
+            raise CatalogError("Dataset registry URL must not contain credentials")
+
+
+def configure_registry(registry: str | None = None, ref: str = DEFAULT_REGISTRY_REF, *,
+                       path: str | Path | None = None, remove: bool = False) -> dict:
+    location = registry_config_path(path)
+    if remove:
+        if registry is not None:
+            raise CatalogError("Do not provide a registry URL with --remove")
+        location.unlink(missing_ok=True)
+        return {"configured": False, "path": str(location)}
+    if registry is None:
+        raise CatalogError("Registry URL is required unless --remove is used")
+    _validate_registry_settings(registry, ref)
+    payload = {"schema_version": 1, "registry": registry, "ref": ref}
+    location.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=location.parent, delete=False) as temporary:
+        temporary.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        temporary_path = Path(temporary.name)
+    temporary_path.chmod(0o600)
+    os.replace(temporary_path, location)
+    return {"configured": True, "registry": registry, "ref": ref,
+            "source": "config_file", "path": str(location)}
+
+
+def registry_status(path: str | Path | None = None) -> dict:
+    registry = os.environ.get("KD_DATASET_REGISTRY")
+    if registry:
+        ref = os.environ.get("KD_DATASET_REGISTRY_REF", DEFAULT_REGISTRY_REF)
+        _validate_registry_settings(registry, ref)
+        return {"configured": True, "registry": registry, "ref": ref,
+                "source": "environment", "path": None}
+    location = registry_config_path(path)
+    if not location.is_file():
+        return {"configured": False, "source": None, "path": str(location)}
+    try:
+        payload = json.loads(location.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise CatalogError(f"Cannot load dataset registry configuration {location}: {error}") from error
+    if payload.get("schema_version") != 1:
+        raise CatalogError("Unsupported dataset registry configuration schema")
+    registry, ref = payload.get("registry"), payload.get("ref")
+    _validate_registry_settings(registry, ref)
+    return {"configured": True, "registry": registry, "ref": ref,
+            "source": "config_file", "path": str(location)}
 
 
 def _canonical(value) -> bytes:
@@ -117,11 +187,10 @@ def _registry_checkout(root: Path, registry: str, ref: str) -> Path:
 
 
 def _mirror_files(root: Path, name: str, recipe: dict) -> dict[str, Path]:
-    registry = os.environ.get("KD_DATASET_REGISTRY")
-    if not registry:
+    settings = registry_status()
+    if not settings["configured"]:
         return {}
-    checkout = _registry_checkout(root, registry,
-                                  os.environ.get("KD_DATASET_REGISTRY_REF", "catalog-v1.2.0"))
+    checkout = _registry_checkout(root, settings["registry"], settings["ref"])
     manifest_path = checkout / "manifests" / name / f"{recipe['version']}.json"
     try:
         manifest = json.loads(manifest_path.read_text())
@@ -296,7 +365,7 @@ def initialize_registry(path: str | Path) -> dict:
         "        with:\n"
         "          lfs: true\n"
         "      - run: git lfs fsck\n"
-        "      - run: git clone --depth 1 --branch source-v0.3.0 https://github.com/spozi/kd-repair.git /tmp/kd-repair\n"
+        "      - run: git clone --depth 1 --branch source-v0.3.2 https://github.com/spozi/kd-repair.git /tmp/kd-repair\n"
         "      - run: python -m pip install -e /tmp/kd-repair --no-deps\n"
         "      - run: python -m kd dataset registry-verify --registry-root .\n")
     return {"initialized": True, "root": str(root), "storage_limit_bytes": load_catalog()["storage_limit_bytes"]}

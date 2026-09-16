@@ -3,6 +3,7 @@ import gzip
 import json
 import os
 from pathlib import Path
+import stat
 import struct
 import tarfile
 import tempfile
@@ -16,9 +17,10 @@ from torch.utils.data import Dataset
 
 from kd.config import DataConfig, ExperimentConfig, TrainConfig
 from kd.data import build_data
-from kd.dataset_registry import (CatalogError, create_mirror_manifest, fetch_dataset,
-                                 initialize_registry, load_catalog, sha256_value,
-                                 validate_registry, verify_dataset)
+from kd.dataset_registry import (CatalogError, configure_registry, create_mirror_manifest,
+                                 fetch_dataset, initialize_registry, load_catalog,
+                                 registry_status, sha256_value, validate_registry,
+                                 verify_dataset)
 
 
 def _digest(data: bytes, algorithm: str) -> str:
@@ -76,6 +78,49 @@ class DatasetRegistryTests(unittest.TestCase):
                 (data_root / "toy/1/payload.bin").write_bytes(b"changed")
                 with self.assertRaisesRegex(CatalogError, "changed"):
                     verify_dataset("toy", root=data_root)
+
+    def test_persisted_registry_config_is_used_without_shell_exports(self):
+        payload = b"persistent private dataset"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "upstream.bin"
+            source.write_bytes(payload)
+            catalog = _catalog(payload, source.as_uri())
+            catalog_path = root / "catalog.json"
+            catalog_path.write_text(json.dumps(catalog))
+            registry = root / "registry"
+            mirror = registry / "datasets/toy/1/archives/payload.bin"
+            mirror.parent.mkdir(parents=True)
+            mirror.write_bytes(payload)
+            manifest = {"schema_version": 1, "dataset": "toy", "version": "1",
+                        "recipe_sha256": sha256_value(catalog["datasets"]["toy"]),
+                        "terms_reviewed": True, "total_bytes": len(payload),
+                        "artifacts": {"raw": {"path": "datasets/toy/1/archives/payload.bin",
+                                                "size": len(payload),
+                                                "sha256": _digest(payload, "sha256")}}}
+            manifest_path = registry / "manifests/toy/1.json"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(json.dumps(manifest))
+            config_path = root / "datasets.json"
+            configured = configure_registry(str(registry), "catalog-v1.2.0", path=config_path)
+            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+            self.assertEqual(configured["source"], "config_file")
+            environment = {"KD_DATASET_REGISTRY": "", "KD_DATASET_REGISTRY_CONFIG": str(config_path)}
+            with patch("kd.dataset_registry.CATALOG_PATH", catalog_path), \
+                    patch.dict(os.environ, environment, clear=False):
+                self.assertEqual(registry_status()["source"], "config_file")
+                result = fetch_dataset("toy", root=root / "data")
+            self.assertEqual(result["artifacts"][0]["source"], "private_registry")
+
+    def test_registry_config_rejects_embedded_http_credentials_and_can_be_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "datasets.json"
+            with self.assertRaisesRegex(CatalogError, "credentials"):
+                configure_registry("https://token@example.test/private.git", path=path)
+            configure_registry("ssh://git@example.test:2222/private.git", path=path)
+            self.assertTrue(path.is_file())
+            self.assertFalse(configure_registry(path=path, remove=True)["configured"])
+            self.assertFalse(path.exists())
 
     def test_registry_initialization_manifest_and_validation(self):
         payload = b"small archive"

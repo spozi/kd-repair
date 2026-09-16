@@ -20,9 +20,10 @@ The initial workspace contained no application, dataset, or teacher checkpoint. 
 
 ## Versioned datasets and private cache
 
-The built-in catalog covers CIFAR-10, CIFAR-100, SVHN, CINIC-10, and GTSRB, with balanced and
-deterministic IF10/50/100 profiles. Raw archives can come from their canonical upstream locations or
-an optional private Git LFS cache; the public source repository never requires private credentials.
+The built-in catalog covers 13 compact vision benchmarks, from CIFAR and SVHN through MedMNIST,
+Caltech-101, EuroSAT, and STL-10, with balanced and deterministic IF10/50/100 profiles. Raw archives
+can come from their canonical upstream locations or an optional private Git LFS cache; the public
+source repository never requires private credentials.
 
 ```bash
 python -m kd dataset list
@@ -30,9 +31,10 @@ python -m kd dataset fetch cifar100 --version 1.0 --profile lt-if100 --root data
 python -m kd dataset verify cifar100 --version 1.0 --profile lt-if100 --root data
 ```
 
-Set `KD_DATASET_REGISTRY` and `KD_DATASET_REGISTRY_REF` only in the local environment to use a
-private mirror. See [the dataset registry protocol](docs/dataset-registry.md) for repository setup,
-license review, selective LFS fetching, and security boundaries.
+Run `python -m kd dataset registry-config --url SSH_URL --ref catalog-v1.2.0` once on a machine to
+use a private mirror automatically. Environment variables remain available as temporary overrides.
+See [the dataset registry protocol](docs/dataset-registry.md) for setup, license review, selective
+LFS fetching, and security boundaries.
 
 ## Run in the existing Conda environment
 
