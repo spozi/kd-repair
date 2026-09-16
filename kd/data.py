@@ -16,6 +16,7 @@ from torchvision import datasets, transforms
 
 from .config import DataConfig, TrainConfig
 from .dataset_registry import PROFILES, dataset_directory, dataset_recipe, sha256_value
+from .runtime import loader_performance_kwargs
 
 
 MEAN = (0.485, 0.456, 0.406)
@@ -457,11 +458,15 @@ def build_data(data: DataConfig, train: TrainConfig, *, include_test: bool = Tru
             if dataset.class_to_idx != splits["train"].class_to_idx:
                 raise ValueError(f"Class names/order differ between train and {split}")
     loaders = {}
+    performance = loader_performance_kwargs(
+        train.device, train.workers, persistent_workers=train.persistent_workers,
+        prefetch_factor=train.prefetch_factor)
     for split, dataset in splits.items():
         loaders[split] = DataLoader(dataset, batch_size=train.batch_size,
                                     shuffle=split == "train" and not diagnostic,
                                     num_workers=train.workers, worker_init_fn=seed_worker,
-                                    generator=torch.Generator().manual_seed(train.seed))
+                                    generator=torch.Generator().manual_seed(train.seed),
+                                    **performance)
     provenance["split_sizes"] = {name: len(dataset) for name, dataset in splits.items()}
     return DataBundle(loaders["train"], loaders["val"], classes, loaders.get("test"), provenance,
                       loaders.get("confirmation"))

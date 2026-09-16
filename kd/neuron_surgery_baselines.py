@@ -11,6 +11,7 @@ from .config import (BenchmarkConfig, DataConfig, DistillationConfig, Experiment
                      ModelConfig, TrainConfig, from_dict)
 from .engine import run_experiment
 from .neuron_surgery_study import NeuronSurgerySpec, _data_available
+from .runtime import accelerator_workers
 
 
 BASELINE_VERSION = 1
@@ -29,9 +30,11 @@ def baseline_configs(output: str | Path, root: str | Path, device: str,
         validation_fraction=0.1,
         confirmation_fraction=spec.confirmation_fraction, split_seed=spec.split_seed,
         imbalance_factor=spec.imbalance_factor)
+    workers = accelerator_workers(device, 0)
     train = TrainConfig(
         epochs=spec.training_epochs, batch_size=128, learning_rate=0.05, momentum=0.9,
-        weight_decay=0.0005, workers=0, threads=4, device=device, seed=spec.teacher_seed)
+        weight_decay=0.0005, workers=workers, threads=4, device=device,
+        seed=spec.teacher_seed)
     teacher = ExperimentConfig(
         name=spec.teacher_run, output_dir=output, data=data,
         student=ModelConfig(spec.teacher_model), teacher=ModelConfig(spec.teacher_model),
@@ -86,7 +89,7 @@ def run_neuron_surgery_baselines(output: str, root: str, device: str,
         "source_sha256": {
             name: fingerprint(Path(__file__).resolve().parent / name)
             for name in ("config.py", "data.py", "engine.py", "models.py",
-                         "neuron_surgery_baselines.py")
+                         "runtime.py", "neuron_surgery_baselines.py")
         },
     }
     protocol = json.loads(json.dumps(protocol, allow_nan=False))

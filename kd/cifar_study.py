@@ -15,6 +15,7 @@ from .data import build_data
 from .engine import resolve_device, run_experiment
 from .evaluation import collect_predictions, paired_comparison, save_prediction_report
 from .models import create_model
+from .runtime import accelerator_workers, configure_accelerator, prepare_model
 
 
 def study_configs(output: str, root: str, device: str, teacher_epochs: int,
@@ -23,11 +24,13 @@ def study_configs(output: str, root: str, device: str, teacher_epochs: int,
         raise ValueError("Study seeds must be nonempty and unique")
     data = DataConfig(source="cifar10", root=root, num_classes=10, image_size=32,
                       horizontal_flip=True, validation_fraction=0.1, split_seed=2026)
+    workers = accelerator_workers(device, 0)
     teacher = ExperimentConfig(name="teacher", output_dir=output, data=data,
                                student=ModelConfig("cifar_teacher"),
                                distillation=DistillationConfig(method="supervised"),
                                train=TrainConfig(epochs=teacher_epochs, batch_size=128, learning_rate=0.05,
-                                                 seed=41, device=device, threads=4),
+                                                 seed=41, device=device, threads=4,
+                                                 workers=workers),
                                benchmark=BenchmarkConfig(warmup=20, iterations=100))
     students = []
     for seed in seeds:
@@ -99,6 +102,7 @@ def run_cifar_study(output="runs/cifar10", root="data", device="auto", teacher_e
     print("All training complete; selection frozen. Starting official test evaluation.", flush=True)
     data = build_data(teacher.data, teacher.train, include_test=True)
     device_object = resolve_device(device)
+    configure_accelerator(device_object, teacher.train.cuda_mode)
     results = {}
     predictions = {}
     for config in configs:
@@ -106,8 +110,10 @@ def run_cifar_study(output="runs/cifar10", root="data", device="auto", teacher_e
         model = create_model(config.student.name, 10)
         load_model_checkpoint(model, summaries[name]["checkpoint"],
                               metadata(config.student.name, data.classes, 32, "cifar10"))
-        model.to(device_object)
-        labels, probabilities = collect_predictions(model, data.test, device_object)
+        prepare_model(model, device_object, config.train.channels_last)
+        labels, probabilities = collect_predictions(
+            model, data.test, device_object, precision=config.train.precision,
+            channels_last=config.train.channels_last)
         quality = save_prediction_report(directory / name / "test", labels, probabilities, data.classes)
         predictions[name] = (labels, probabilities)
         results[name] = {"test": quality, "validation": summaries[name]["validation"],

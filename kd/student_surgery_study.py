@@ -13,6 +13,7 @@ from .checkpoints import fingerprint, write_json
 from .config import DistillationConfig, ModelConfig, SurgeryConfig, from_dict
 from .data import build_data
 from .evaluation import paired_calibration_comparison, paired_comparison
+from .runtime import accelerator_workers
 from .neuron_surgery_study import (
     BOOTSTRAP_REPETITIONS,
     NeuronSurgerySpec,
@@ -141,7 +142,9 @@ def _supervised_config(source_config, output: Path, seed: int, device: str):
         output_dir=str(output),
         teacher=ModelConfig(source_config.student.name),
         distillation=DistillationConfig(method="supervised"),
-        train=replace(source_config.train, seed=seed, device=device),
+        train=replace(
+            source_config.train, seed=seed, device=device,
+            workers=accelerator_workers(device, source_config.train.workers)),
         surgery=SurgeryConfig(),
     )
     config.validate(require_teacher=False)
@@ -234,7 +237,8 @@ def run_student_surgery_study(
         "source_sha256": {
             name: fingerprint(Path(__file__).parent / name)
             for name in ("student_surgery_study.py", "neuron_surgery.py",
-                         "neuron_surgery_study.py", "engine.py", "data.py", "models.py")
+                         "neuron_surgery_study.py", "engine.py", "data.py", "models.py",
+                         "runtime.py")
         },
     }
     if dry_run:

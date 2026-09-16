@@ -49,7 +49,40 @@ python -m kd smoke --output runs/my-smoke
 
 No downloads or additional test packages are needed in the existing `kd` environment. The smoke command trains a small teacher, runs all **21 student variants**, and writes `runs/my-smoke/ablations/comparison.json` and `comparison.csv`. Use a new output directory on subsequent runs. Synthetic accuracies are execution checks, not evidence that one distillation method is better.
 
-The implementation was verified on Python 3.12.12, PyTorch `2.14.0.dev20260618`, and torchvision `0.29.0.dev20260618`. Unit tests and synthetic smoke runs use CPU; the CIFAR-10 study uses the Mac's MPS GPU. CUDA remains untested in this environment. Dependencies are declared in `pyproject.toml`; an optional `python -m pip install -e . --no-deps` enables the `kd` console command. Module commands work directly without installing the project.
+The implementation was verified on Python 3.12.12, PyTorch `2.14.0.dev20260618`, and torchvision `0.29.0.dev20260618`. Unit tests and synthetic smoke runs use CPU; the CIFAR-10 study uses the Mac's MPS GPU. CUDA execution paths are covered by configuration and CPU-side integration tests but cannot be physically exercised on this Mac. Run the CUDA preflight below on every GPU server before starting a study. Dependencies are declared in `pyproject.toml`; an optional `python -m pip install -e . --no-deps` enables the `kd` console command. Module commands work directly without installing the project.
+
+## NVIDIA CUDA servers
+
+Install a CUDA-enabled PyTorch build appropriate for the server, then verify the complete optimized
+path rather than relying only on `torch.cuda.is_available()`:
+
+```bash
+nvidia-smi
+python -m kd cuda-check --device cuda:0 --precision auto
+```
+
+CUDA training defaults to BF16 on supported GPUs and scaled FP16 otherwise. It also enables TF32,
+cuDNN autotuning, fused SGD, channels-last convolution tensors, pinned host batches, and asynchronous host-to-GPU
+copies. These choices and the resolved GPU properties are stored in each run's `summary.json`.
+
+For ordinary configuration files, use:
+
+```toml
+[train]
+device = "cuda:0"
+precision = "auto"
+cuda_mode = "fast"
+channels_last = true
+workers = 4
+persistent_workers = false
+prefetch_factor = 2
+```
+
+`cuda_mode = "fast"` prioritizes throughput and permits nondeterministic cuDNN kernel selection. For a
+strict reproducibility audit, use `cuda_mode = "deterministic"` and `precision = "float32"`; this disables
+TF32 and cuDNN autotuning. Keeping `persistent_workers = false` preserves epoch-boundary data-loader RNG
+restoration after a checkpoint resume. See [CUDA execution](docs/cuda.md) for server setup, multi-GPU job
+placement, memory tuning, and experiment-specific behavior.
 
 ## Train on images
 

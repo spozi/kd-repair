@@ -9,6 +9,7 @@ import torch
 from .config import from_dict, load_config
 from .engine import evaluate_checkpoint, resolve_device, run_experiment, seed_everything
 from .experiments import grid_configs, run_ablation, run_smoke
+from .runtime import valid_device_spec
 
 
 DATASET_CHOICES = [
@@ -16,6 +17,12 @@ DATASET_CHOICES = [
     "pathmnist", "bloodmnist", "dermamnist", "organamnist", "caltech101",
     "eurosat", "stl10",
 ]
+
+
+def device_spec(value: str) -> str:
+    if not valid_device_spec(value):
+        raise argparse.ArgumentTypeError("expected auto, cpu, mps, cuda, or cuda:N")
+    return value
 
 
 def read_config(path: str):
@@ -44,7 +51,7 @@ def main(argv=None) -> None:
     surgery.add_argument("--config", required=True)
     surgery.add_argument("--checkpoint", required=True)
     surgery.add_argument("--output", required=True)
-    surgery.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"],
+    surgery.add_argument("--device", type=device_spec,
                          help="Override train.device for diagnostics")
     surgery.add_argument("--split", choices=["train", "val", "test"], default="train")
     surgery.add_argument("--fraction", type=float, default=0.05)
@@ -55,28 +62,35 @@ def main(argv=None) -> None:
     surgery.add_argument("--min-slice-size", type=int, default=2)
     smoke = subparsers.add_parser("smoke", help="Run offline synthetic teacher training and all ablations on CPU")
     smoke.add_argument("--output", default="runs/smoke")
+    cuda_check = subparsers.add_parser(
+        "cuda-check", help="Run a CUDA transfer, mixed-precision, backward, and optimizer preflight")
+    cuda_check.add_argument("--device", type=device_spec, default="cuda")
+    cuda_check.add_argument("--precision", choices=["auto", "float32", "float16", "bfloat16"],
+                            default="auto")
+    cuda_check.add_argument("--batch-size", type=int, default=128)
+    cuda_check.add_argument("--iterations", type=int, default=10)
     cifar = subparsers.add_parser("cifar10", help="Run the full held-out, repeated-seed CIFAR-10 study")
     cifar.add_argument("--output", default="runs/cifar10")
     cifar.add_argument("--root", default="data")
-    cifar.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    cifar.add_argument("--device", type=device_spec, default="auto")
     cifar.add_argument("--teacher-epochs", type=int, default=30)
     cifar.add_argument("--student-epochs", type=int, default=20)
     cifar.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     calibration = subparsers.add_parser("calibration-study", help="Compare fixed KD against triggered MMCE across three seeds")
     calibration.add_argument("--baseline",default="runs/cifar10")
     calibration.add_argument("--output",default="runs/cifar10-calibration")
-    calibration.add_argument("--device",choices=["auto","cpu","cuda","mps"],default="mps")
+    calibration.add_argument("--device", type=device_spec, default="mps")
     cpc = subparsers.add_parser("cpc-study", help="Compare matched KD and fixed-coefficient CPC with validation-fitted TS")
     cpc.add_argument("--baseline", default="runs/cifar10")
     cpc.add_argument("--output", default="runs/cifar10-cpc")
-    cpc.add_argument("--device", choices=["auto","cpu","cuda","mps"], default="mps")
+    cpc.add_argument("--device", type=device_spec, default="mps")
     cpc.add_argument("--dry-run", action="store_true", help="Validate and print the protocol without training or writing artifacts")
     neuron = subparsers.add_parser(
         "neuron-surgery-study",
         help="Repair the factor-100 CIFAR-10-LT teacher channels, then run matched KD")
     neuron.add_argument("--baseline", default="runs/cifar10-lt-multiseed")
     neuron.add_argument("--output", default="runs/cifar10-lt-neuron-surgery")
-    neuron.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    neuron.add_argument("--device", type=device_spec, default="auto")
     neuron.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     neuron.add_argument("--study-config",
                         help="JSON NeuronSurgerySpec; omitted for the original factor-100 protocol")
@@ -88,7 +102,7 @@ def main(argv=None) -> None:
     neuron_baselines.add_argument("--study-config", required=True)
     neuron_baselines.add_argument("--output", required=True)
     neuron_baselines.add_argument("--root", default="data")
-    neuron_baselines.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"],
+    neuron_baselines.add_argument("--device", type=device_spec,
                                   default="auto")
     neuron_baselines.add_argument("--dry-run", action="store_true")
     neuron_campaign = subparsers.add_parser(
@@ -98,7 +112,7 @@ def main(argv=None) -> None:
     neuron_campaign.add_argument("--root", default="data")
     neuron_campaign.add_argument("--baseline", default="runs/cifar10-lt-multiseed")
     neuron_campaign.add_argument("--reference", default="runs/cifar10-lt-neuron-surgery")
-    neuron_campaign.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"],
+    neuron_campaign.add_argument("--device", type=device_spec,
                                  default="auto")
     neuron_campaign.add_argument("--dry-run", action="store_true")
     student_surgery = subparsers.add_parser(
@@ -106,7 +120,7 @@ def main(argv=None) -> None:
         help="Compare supervised student surgery against matched supervised and KD arms")
     student_surgery.add_argument("--source", default="runs/cifar10-lt-neuron-campaign")
     student_surgery.add_argument("--output", default="runs/cifar10-lt-student-surgery")
-    student_surgery.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"],
+    student_surgery.add_argument("--device", type=device_spec,
                                  default="auto")
     student_surgery.add_argument("--seeds", type=int, nargs="+", default=[142, 143, 144])
     student_surgery.add_argument("--dry-run", action="store_true")
@@ -140,7 +154,12 @@ def main(argv=None) -> None:
     validate_registry.add_argument("--registry-root", default=".")
     args = parser.parse_args(argv)
     try:
-        if args.command == "dataset":
+        if args.command == "cuda-check":
+            from .runtime import cuda_preflight
+            report = cuda_preflight(args.device, args.precision,
+                                    batch_size=args.batch_size,
+                                    iterations=args.iterations)
+        elif args.command == "dataset":
             from .dataset_registry import (configure_registry, create_mirror_manifest,
                                            fetch_dataset, initialize_registry, list_datasets,
                                            registry_status, validate_registry, verify_dataset)

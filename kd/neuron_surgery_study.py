@@ -31,6 +31,8 @@ from .neuron_surgery import (FORMAT_VERSION, TAIL_CLASSES, build_companion_recor
                              localization_stages,
                              select_hard_tail_targets, select_preservation_indices,
                              train_repair_candidate, validate_repair_provenance)
+from .runtime import (accelerator_workers, configure_accelerator,
+                      loader_performance_kwargs, prepare_model, runtime_metadata)
 
 
 STUDY_VERSION = 3
@@ -43,7 +45,8 @@ EXPECTED_TARGET_COUNTS = (70, 42, 25, 15, 9)
 STATISTICS_SEED = 2026
 BOOTSTRAP_REPETITIONS = 2000
 COMPUTE_SOURCES = ("config.py", "data.py", "neuron_surgery.py",
-                   "neuron_surgery_study.py", "losses.py", "models.py")
+                   "neuron_surgery_study.py", "losses.py", "models.py",
+                   "runtime.py")
 
 
 @dataclass(frozen=True)
@@ -389,8 +392,10 @@ def _tail_metrics(labels, probabilities, target_classes=TAIL_CLASSES) -> dict:
 
 
 def _validation_report(model, loader, device, classes,
-                       target_classes=TAIL_CLASSES) -> dict:
-    labels, probability = collect_predictions(model, loader, device)
+                       target_classes=TAIL_CLASSES, *, precision="float32",
+                       channels_last=False) -> dict:
+    labels, probability = collect_predictions(
+        model, loader, device, precision=precision, channels_last=channels_last)
     return {**prediction_metrics(labels, probability, classes),
             **_tail_metrics(labels, probability, target_classes)}
 
@@ -429,9 +434,15 @@ def _train_candidate(directory: Path, identity: dict, teacher_config, teacher_ch
         batch_size=spec.repair_batch_size, learning_rate=learning_rate, momentum=0.9,
         temperature=4.0, kd_weight=spec.kd_weight, feature_weight=spec.feature_weight,
         preservation_ce_weight=spec.preservation_ce_weight,
-        feature_stages=_configured_stages(spec), seed=REPAIR_SEED)
-    validation = _validation_report(candidate, validation_loader, device, classes,
-                                    spec.target_classes)
+        feature_stages=_configured_stages(spec), seed=REPAIR_SEED,
+        precision=teacher_config.train.precision,
+        channels_last=teacher_config.train.channels_last,
+        fail_fast=(device.type != "cuda"
+                   or teacher_config.train.cuda_mode == "deterministic"))
+    validation = _validation_report(
+        candidate, validation_loader, device, classes, spec.target_classes,
+        precision=teacher_config.train.precision,
+        channels_last=teacher_config.train.channels_last)
     checkpoint = {**metadata(spec.teacher_model, classes, teacher_config.data.image_size,
                              teacher_config.data.source), "kind": "inference",
                   "epoch": spec.repair_epochs - 1, "student": candidate.cpu().state_dict(),
@@ -584,6 +595,12 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
                 "student_run_count": len(seeds) if spec.downstream_kd else 0,
                 "repair_candidate_count": len(spec.channel_budgets) * len(spec.learning_rates)}
     resolved_device = resolve_device(device)
+    deterministic = teacher_config.train.cuda_mode == "deterministic"
+    seed_everything(REPAIR_SEED, deterministic=deterministic)
+    configure_accelerator(resolved_device, teacher_config.train.cuda_mode)
+    accelerator = runtime_metadata(
+        resolved_device, teacher_config.train.precision,
+        teacher_config.train.cuda_mode, teacher_config.train.channels_last)
     if directory.exists() and not (directory / "protocol.json").exists() and any(directory.iterdir()):
         raise FileExistsError(f"Nonempty study directory has no protocol: {directory}")
     if (directory / "protocol.json").exists() and _read(directory / "protocol.json") != protocol:
@@ -594,7 +611,8 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
     _freeze(directory / "environment.json", {"python": sys.version, "torch": str(torch.__version__),
                                                "torchvision": str(torchvision.__version__),
                                                "numpy": np.__version__, "platform": platform.platform(),
-                                               "device": str(resolved_device)})
+                                               "device": str(resolved_device),
+                                               "accelerator": accelerator})
     final_manifest = directory / "report_manifest.json"
     if final_manifest.exists():
         manifest = _read(final_manifest)
@@ -606,7 +624,8 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
         return _read(directory / "comparison.json")
 
     torch.set_num_threads(teacher_config.train.threads)
-    seed_everything(REPAIR_SEED)
+    seed_everything(REPAIR_SEED, deterministic=deterministic)
+    configure_accelerator(resolved_device, teacher_config.train.cuda_mode)
     diagnostic_data = build_data(teacher_config.data, replace(teacher_config.train, seed=REPAIR_SEED,
                                                                workers=0, device=device),
                                  include_test=False, diagnostic=True)
@@ -623,7 +642,8 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
                  teacher_config.data.source))
     if teacher_state.get("epoch", -1) < 0:
         raise ValueError("Repair teacher checkpoint must come from a completed training epoch")
-    teacher.to(resolved_device).requires_grad_(False).eval()
+    prepare_model(teacher, resolved_device,
+                  teacher_config.train.channels_last).requires_grad_(False).eval()
     data_identity = {"protocol_sha256": protocol_sha256, "teacher_sha256": fingerprint(teacher_checkpoint),
                      "data": diagnostic_data.provenance, "classes": diagnostic_data.classes}
 
@@ -681,10 +701,12 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
 
     target_loader = DataLoader(Subset(diagnostic_data.train.dataset,
                                       [row["index"] for row in target_plan["targets"]]),
-                               batch_size=128, shuffle=False, num_workers=0)
+                               batch_size=128, shuffle=False, num_workers=0,
+                               **loader_performance_kwargs(str(resolved_device), 0))
     preservation_loader = DataLoader(Subset(diagnostic_data.train.dataset,
                                             target_plan["causal_preservation_indices"]),
-                                     batch_size=128, shuffle=False, num_workers=0)
+                                     batch_size=128, shuffle=False, num_workers=0,
+                                     **loader_performance_kwargs(str(resolved_device), 0))
     causal_identity = {"protocol_sha256": protocol_sha256,
                        "consensus_sha256": fingerprint(directory / "consensus_scores.json"),
                        "targets_sha256": fingerprint(directory / "targets.json")}
@@ -726,7 +748,8 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
 
     original_validation = _validation_report(
         teacher, diagnostic_data.val, resolved_device, diagnostic_data.classes,
-        spec.target_classes)
+        spec.target_classes, precision=teacher_config.train.precision,
+        channels_last=teacher_config.train.channels_last)
     _freeze(directory / "teacher_validation_baseline.json", original_validation)
     augmented_data = build_data(teacher_config.data,
                                 replace(teacher_config.train, seed=REPAIR_SEED, workers=0, device=device),
@@ -835,7 +858,10 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
         repaired = replace(config, name=f"kd_repaired_{spec.name}_seed{seed}",
                            output_dir=str(directory),
                            teacher=replace(config.teacher, checkpoint=str(repaired_checkpoint)),
-                           train=replace(config.train, device=device), surgery=SurgeryConfig())
+                           train=replace(
+                               config.train, device=device,
+                               workers=accelerator_workers(device, config.train.workers)),
+                           surgery=SurgeryConfig())
         repaired.validate()
         repaired_configs[seed] = repaired
         summary = _complete_student(repaired, protocol_sha256)

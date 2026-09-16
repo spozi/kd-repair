@@ -18,6 +18,7 @@ from .engine import resolve_device, run_experiment
 from .evaluation import (collect_predictions, paired_calibration_comparison, paired_comparison,
                          save_prediction_report)
 from .models import create_model
+from .runtime import accelerator_workers, configure_accelerator, prepare_model
 
 
 def intervention_configs(baseline: Path, output: Path, device: str):
@@ -28,7 +29,9 @@ def intervention_configs(baseline: Path, output: Path, device: str):
             raise ValueError("Expected the original CIFAR-10 KD configurations for seeds 42,43,44")
         for condition in ("control", "mmce"):
             candidate = replace(config, name=f"kd_{condition}_seed{seed}", output_dir=str(output),
-                                train=replace(config.train,device=device),
+                                train=replace(
+                                    config.train, device=device,
+                                    workers=accelerator_workers(device, config.train.workers)),
                                 calibration=CalibrationConfig(enabled=condition=="mmce"))
             candidate.validate()
             configs.append(candidate)
@@ -38,7 +41,7 @@ def intervention_configs(baseline: Path, output: Path, device: str):
 def run_calibration_study(baseline="runs/cifar10", output="runs/cifar10-calibration", device="mps") -> dict:
     baseline, directory = Path(baseline), Path(output)
     configs = intervention_configs(baseline, directory, device)
-    source_files = ("config.py","data.py","models.py","losses.py","calibration.py","engine.py","metrics.py","evaluation.py","calibration_study.py")
+    source_files = ("config.py","data.py","models.py","losses.py","calibration.py","engine.py","metrics.py","evaluation.py","runtime.py","calibration_study.py")
     protocol = {"version":1, "question":"Does triggered MMCE reduce KD calibration error while preserving accuracy?",
                 "loss":"Existing classical KD + gamma * unweighted empirical MMCE norm; Laplacian bandwidth 0.4",
                 "trigger":"After warmup (epoch >=5), ECE >0.03 and confidence-accuracy >0.01 for three consecutive validation epochs",
@@ -86,13 +89,16 @@ def run_calibration_study(baseline="runs/cifar10", output="runs/cifar10-calibrat
     first = configs[0]
     data = build_data(first.data,first.train,include_test=True)
     target_device = resolve_device(device)
+    configure_accelerator(target_device, first.train.cuda_mode)
     results, predictions = {}, {}
     for config in configs:
         model = create_model(config.student.name,config.data.num_classes)
         load_model_checkpoint(model,summaries[config.name]["checkpoint"],
                               metadata(config.student.name,data.classes,config.data.image_size,config.data.source))
-        model.to(target_device)
-        labels, probabilities = collect_predictions(model,data.test,target_device)
+        prepare_model(model, target_device, config.train.channels_last)
+        labels, probabilities = collect_predictions(
+            model, data.test, target_device, precision=config.train.precision,
+            channels_last=config.train.channels_last)
         quality = save_prediction_report(directory/config.name/"test",labels,probabilities,data.classes)
         predictions[config.name] = (labels,probabilities)
         results[config.name] = {**summaries[config.name],"test":quality}

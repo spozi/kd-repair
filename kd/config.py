@@ -5,6 +5,8 @@ import math
 from pathlib import Path
 import tomllib
 
+from .runtime import CUDA_MODES, PRECISIONS, valid_device_spec
+
 
 @dataclass(frozen=True)
 class DataConfig:
@@ -62,6 +64,13 @@ class TrainConfig:
     seed: int = 42
     device: str = "auto"
     threads: int = 2
+    # CUDA defaults favor throughput. Use cuda_mode="deterministic" and
+    # precision="float32" when bitwise-oriented reruns matter more than speed.
+    precision: str = "auto"
+    cuda_mode: str = "fast"
+    channels_last: bool = True
+    persistent_workers: bool = False
+    prefetch_factor: int = 2
 
 
 @dataclass(frozen=True)
@@ -220,6 +229,7 @@ class ExperimentConfig:
             "train_samples": self.data.train_samples, "val_samples": self.data.val_samples,
             "test_samples": self.data.test_samples, "epochs": self.train.epochs,
             "batch_size": self.train.batch_size, "threads": self.train.threads,
+            "prefetch_factor": self.train.prefetch_factor,
             "iterations": self.benchmark.iterations,
         }.items():
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -261,8 +271,15 @@ class ExperimentConfig:
             raise ValueError("Feature distillation needs explicit [student_stage, teacher_stage] pairs")
         if require_teacher and d.method != "supervised" and not self.teacher.checkpoint:
             raise ValueError("KD requires a trained teacher.checkpoint; train a supervised teacher first")
-        if self.train.device not in {"auto", "cpu", "cuda", "mps"}:
-            raise ValueError("device must be auto, cpu, cuda, or mps")
+        if not valid_device_spec(self.train.device):
+            raise ValueError("device must be auto, cpu, mps, cuda, or cuda:N")
+        if self.train.precision not in PRECISIONS:
+            raise ValueError(f"precision must be one of {PRECISIONS}")
+        if self.train.cuda_mode not in CUDA_MODES:
+            raise ValueError(f"cuda_mode must be one of {CUDA_MODES}")
+        for name in ("channels_last", "persistent_workers"):
+            if not isinstance(getattr(self.train, name), bool):
+                raise ValueError(f"train.{name} must be a boolean")
         c = self.calibration
         for name, value in {"max_weight": c.max_weight, "kernel_bandwidth": c.kernel_bandwidth}.items():
             if not math.isfinite(value) or value <= 0:

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from .checkpoints import write_json
+from .runtime import autocast_context, move_images
 
 
 def wilson_interval(correct: int, count: int, z: float = 1.959963984540054) -> list[float]:
@@ -59,18 +60,21 @@ def prediction_metrics(labels: np.ndarray, probabilities: np.ndarray, classes: l
 
 
 @torch.inference_mode()
-def collect_predictions(model, loader, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+def collect_predictions(model, loader, device: torch.device, *, precision="float32",
+                        channels_last=False) -> tuple[np.ndarray, np.ndarray]:
     previous_mode = model.training
     model.eval()
     labels, probabilities = [], []
     try:
         for images, targets in loader:
-            logits = model(images.to(device)).logits.float()
-            probabilities.append(logits.softmax(1).cpu().numpy())
+            images = move_images(images, device, channels_last)
+            with autocast_context(device, precision):
+                logits = model(images).logits.float()
+            probabilities.append(logits.softmax(1))
             labels.append(targets.numpy())
     finally:
         model.train(previous_mode)
-    return np.concatenate(labels), np.concatenate(probabilities)
+    return np.concatenate(labels), torch.cat(probabilities).cpu().numpy()
 
 
 def save_prediction_report(directory: Path, labels, probabilities, classes: list[str], *, extended=False) -> dict:

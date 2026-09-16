@@ -15,6 +15,9 @@ from .checkpoints import fingerprint, load_model_checkpoint, metadata, write_jso
 from .config import ExperimentConfig, SurgeryConfig
 from .data import DataBundle, SyntheticImages, build_data, seed_worker
 from .models import create_model
+from .runtime import (autocast_context, configure_accelerator,
+                      loader_performance_kwargs, move_images, move_labels,
+                      prepare_model)
 
 
 FORMAT_VERSION = 1
@@ -89,7 +92,8 @@ def dataset_contract(config: ExperimentConfig, data: DataBundle, split: str) -> 
 
 
 @torch.inference_mode()
-def collect_sample_diagnostics(model, loader, device: torch.device) -> list[dict]:
+def collect_sample_diagnostics(model, loader, device: torch.device, *,
+                               precision="float32", channels_last=False) -> list[dict]:
     """Collect stable dataset-local scores from a non-shuffled diagnostic loader."""
     previous_mode = model.training
     model.eval()
@@ -97,8 +101,10 @@ def collect_sample_diagnostics(model, loader, device: torch.device) -> list[dict
     offset = 0
     try:
         for images, labels in loader:
-            labels_device = labels.to(device)
-            output = model(images.to(device))
+            labels_device = move_labels(labels, device)
+            images = move_images(images, device, channels_last)
+            with autocast_context(device, precision):
+                output = model(images)
             logits = output.logits if hasattr(output, "logits") else output
             logits = logits.float()
             if logits.ndim != 2 or logits.shape[0] != labels.shape[0]:
@@ -264,8 +270,11 @@ def create_surgery_plan(config: ExperimentConfig, checkpoint: str | Path, output
     model = create_model(config.student.name, config.data.num_classes)
     expected = metadata(config.student.name, data.classes, config.data.image_size, config.data.source)
     load_model_checkpoint(model, checkpoint, expected)
-    model.to(device)
-    records = collect_sample_diagnostics(model, loader, device)
+    configure_accelerator(device, config.train.cuda_mode)
+    prepare_model(model, device, config.train.channels_last)
+    records = collect_sample_diagnostics(
+        model, loader, device, precision=config.train.precision,
+        channels_last=config.train.channels_last)
     budget = max(1, math.ceil(len(records) * fraction))
     if max_samples is not None:
         budget = min(budget, max_samples)
@@ -344,7 +353,11 @@ def apply_training_surgery(data: DataBundle, config: ExperimentConfig) -> tuple[
     kept = [index for index in range(original_size) if index not in dropped]
     loader = DataLoader(Subset(data.train.dataset, kept), batch_size=config.train.batch_size,
                         shuffle=True, num_workers=config.train.workers, worker_init_fn=seed_worker,
-                        generator=torch.Generator().manual_seed(config.train.seed))
+                        generator=torch.Generator().manual_seed(config.train.seed),
+                        **loader_performance_kwargs(
+                            config.train.device, config.train.workers,
+                            persistent_workers=config.train.persistent_workers,
+                            prefetch_factor=config.train.prefetch_factor))
     plan_path = Path(surgery.plan)
     info = {
         "enabled": True,

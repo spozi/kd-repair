@@ -23,6 +23,7 @@ from .engine import resolve_device, run_experiment, seed_everything
 from .evaluation import prediction_metrics, save_prediction_report
 from .models import create_model
 from .posthoc import LogitCalibrator, collect_logits, fit_calibrators
+from .runtime import accelerator_workers
 
 
 SEEDS = (42, 43, 44)
@@ -34,7 +35,7 @@ METRICS = ("accuracy", "aurc", "ece_15_bins", "ece_equal_mass_15_bins", "ece_l2_
            "selective_accuracy_80", "selective_accuracy_90")
 COMPUTE_SOURCES = ("config.py", "data.py", "models.py", "losses.py", "cpc.py", "calibration.py",
                    "adaptive_focal.py", "engine.py", "metrics.py", "evaluation.py", "posthoc.py",
-                   "checkpoints.py", "calibration_metrics.py", "cpc_study.py")
+                   "runtime.py", "checkpoints.py", "calibration_metrics.py", "cpc_study.py")
 
 
 def _json(value):
@@ -75,7 +76,9 @@ def intervention_configs(baseline, output, device):
             candidate = replace(cfg, name=f"kd_{arm}_seed{seed}", output_dir=str(output),
                                 data=replace(cfg.data, download=False),
                                 teacher=replace(cfg.teacher, checkpoint=str(Path(cfg.teacher.checkpoint).resolve())),
-                                train=replace(cfg.train, device=device),
+                                train=replace(
+                                    cfg.train, device=device,
+                                    workers=accelerator_workers(device, cfg.train.workers)),
                                 cpc=CPCConfig(enabled=arm == "cpc", discrimination_weight=.1, exclusion_weight=.1),
                                 calibration=CalibrationConfig(), supervised_loss=SupervisedLossConfig())
             candidate.validate()

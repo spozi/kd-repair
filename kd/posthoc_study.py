@@ -101,7 +101,7 @@ def run_study(run, output):
                 'device':'cpu', 'temperatures':temperatures, 'gammas':gammas,
                 'fit_split':'validation', 'primary_criterion':'nll', 'secondary_criterion':'ece',
                 'ece_bins':15, 'ece_binning':'equal_width', 'bootstrap_seed':2026, 'bootstrap_repetitions':2000,
-                'source_sha256':{name:fingerprint(Path(__file__).parent/name) for name in ('posthoc.py','posthoc_study.py','evaluation.py','data.py','models.py')},
+                'source_sha256':{name:fingerprint(Path(__file__).parent/name) for name in ('posthoc.py','posthoc_study.py','evaluation.py','data.py','models.py','runtime.py')},
                 'versions':{'torch':str(torch.__version__), 'numpy':np.__version__}}
     write_json(output/'protocol.json', protocol)
     data = build_data(cfg.data,cfg.train,include_test=False)

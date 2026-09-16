@@ -14,6 +14,8 @@ from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 
 from .losses import LogitsKD
 from .models import CifarCNN, ModelOutput, ResNetAdapter, VisionModel
+from .runtime import (autocast_context, loader_performance_kwargs, make_grad_scaler,
+                      move_images, move_labels, prepare_model, resolve_precision)
 
 
 FORMAT_VERSION = 1
@@ -39,7 +41,8 @@ def _stage_module(model: VisionModel, stage: str) -> nn.Module:
 
 
 def collect_teacher_diagnostics(model: VisionModel, loader,
-                                device: torch.device) -> tuple[list[dict], np.ndarray]:
+                                device: torch.device, *, precision="float32",
+                                channels_last=True) -> tuple[list[dict], np.ndarray]:
     """Collect canonical predictions and normalized final-stage embeddings in dataset order."""
     embedding_stage = localization_stages(model)[-1]
     previous_mode = model.training
@@ -50,8 +53,10 @@ def collect_teacher_diagnostics(model: VisionModel, loader,
     try:
         with torch.inference_mode():
             for images, labels in loader:
-                labels_device = labels.to(device)
-                output = model(images.to(device), return_features=True)
+                labels_device = move_labels(labels, device)
+                images = move_images(images, device, channels_last)
+                with autocast_context(device, precision):
+                    output = model(images, return_features=True)
                 logits = output.logits.float()
                 if not torch.isfinite(logits).all():
                     raise FloatingPointError("Non-finite logits in neuron-surgery diagnostics")
@@ -186,7 +191,8 @@ def differential_channel_scores(model: VisionModel, dataset: Dataset,
     if score_mode not in {"differential", "gradient_only"}:
         raise ValueError("score_mode must be differential or gradient_only")
     loader = DataLoader(CompanionDataset(dataset, companion_records), batch_size=batch_size,
-                        shuffle=False, num_workers=0)
+                        shuffle=False, num_workers=0,
+                        **loader_performance_kwargs(str(device), 0))
     previous_mode = model.training
     requires_grad = [parameter.requires_grad for parameter in model.parameters()]
     model.requires_grad_(False).eval()
@@ -194,8 +200,8 @@ def differential_channel_scores(model: VisionModel, dataset: Dataset,
     labels_seen, indices_seen = [], []
     try:
         for target_images, labels, target_indices, companion_images in loader:
-            target_images = target_images.to(device).requires_grad_(True)
-            labels_device = labels.to(device)
+            target_images = move_images(target_images, device).requires_grad_(True)
+            labels_device = move_labels(labels, device)
             target_output = model(target_images, return_features=True)
             for stage in stages:
                 target_output.features[stage].retain_grad()
@@ -208,8 +214,8 @@ def differential_channel_scores(model: VisionModel, dataset: Dataset,
             companion_output = None
             if score_mode == "differential":
                 with torch.no_grad():
-                    companion_output = model(companion_images.flatten(0, 1).to(device),
-                                             return_features=True)
+                    companion_batch = move_images(companion_images.flatten(0, 1), device)
+                    companion_output = model(companion_batch, return_features=True)
             for stage in stages:
                 target_feature = target_output.features[stage].detach()
                 sensitivity = target_output.features[stage].grad.abs().mean((2, 3))
@@ -315,31 +321,37 @@ def measure_repair_set(model: VisionModel, loader, device: torch.device,
     """Measure accuracy, NLL, and an equally weighted true-versus-rival margin."""
     previous_mode = model.training
     model.eval()
-    count = correct = 0
-    nll_sum = 0.0
-    margins: dict[int, list[float]] = {}
+    count = 0
+    correct = torch.zeros((), dtype=torch.long, device=device)
+    nll_sum = torch.zeros((), device=device)
+    labels_seen, margins_seen = [], []
     try:
         for images, labels in loader:
-            labels_device = labels.to(device)
-            logits = model(images.to(device)).logits.float()
+            labels_device = move_labels(labels, device)
+            logits = model(move_images(images, device)).logits.float()
             competitors = logits.clone()
             competitors.scatter_(1, labels_device[:, None], -torch.inf)
             true_logits = logits.gather(1, labels_device[:, None]).squeeze(1)
             margin = true_logits - competitors.max(1).values
             predictions = logits.argmax(1)
             count += labels.numel()
-            correct += predictions.eq(labels_device).sum().item()
-            nll_sum += F.cross_entropy(logits, labels_device, reduction="sum").item()
-            for label, value in zip(labels.tolist(), margin.cpu().tolist()):
-                margins.setdefault(int(label), []).append(float(value))
+            correct += predictions.eq(labels_device).sum()
+            nll_sum += F.cross_entropy(logits, labels_device, reduction="sum")
+            labels_seen.append(labels_device)
+            margins_seen.append(margin)
     finally:
         model.train(previous_mode)
     if not count:
         raise ValueError("Cannot measure an empty repair set")
+    labels_array = torch.cat(labels_seen).cpu().numpy()
+    margin_array = torch.cat(margins_seen).cpu().numpy()
+    margins = {int(label): margin_array[labels_array == label]
+               for label in np.unique(labels_array)}
     classes = tuple(sorted(margins) if balanced_classes is None else balanced_classes)
     if any(label not in margins for label in classes):
         raise ValueError("Every balanced class must occur in the measured set")
-    return {"samples": count, "accuracy": correct / count, "nll": nll_sum / count,
+    return {"samples": count, "accuracy": correct.item() / count,
+            "nll": nll_sum.item() / count,
             "class_balanced_margin": float(np.mean([np.mean(margins[label]) for label in classes]))}
 
 
@@ -543,7 +555,9 @@ def train_repair_candidate(candidate: VisionModel, anchor: VisionModel, dataset:
                            kd_weight: float = 1.0, feature_weight: float = 0.25,
                            preservation_ce_weight: float = 0.0,
                            feature_stages: tuple[str, ...] | None = None,
-                           seed: int = 2026) -> tuple[list[dict], dict]:
+                           seed: int = 2026, precision: str = "auto",
+                           channels_last: bool = True,
+                           fail_fast: bool = True) -> tuple[list[dict], dict]:
     """Fine-tune only selected channel-connected weights under preservation losses."""
     if min(epochs, samples_per_epoch, batch_size) < 1:
         raise ValueError("Repair epochs, samples_per_epoch, and batch_size must be positive")
@@ -551,8 +565,9 @@ def train_repair_candidate(candidate: VisionModel, anchor: VisionModel, dataset:
     if len(labels) != len(dataset):
         raise ValueError("Repair labels must align with the dataset")
     torch.manual_seed(seed)
-    candidate.to(device).eval()
-    anchor.to(device).requires_grad_(False).eval()
+    prepare_model(candidate, device, channels_last).eval()
+    prepare_model(anchor, device, channels_last).requires_grad_(False).eval()
+    precision = resolve_precision(precision, device)
     if type(candidate) is not type(anchor) or candidate.feature_channels != anchor.feature_channels:
         raise ValueError("Candidate and anchor must use the same repair architecture")
     feature_stages = localization_stages(candidate) if feature_stages is None else tuple(feature_stages)
@@ -564,45 +579,66 @@ def train_repair_candidate(candidate: VisionModel, anchor: VisionModel, dataset:
                                              replacement=True,
                                              generator=torch.Generator().manual_seed(seed + 1))
     target_loader = DataLoader(Subset(dataset, target_indices), batch_size=batch_size,
-                               sampler=target_sampler, num_workers=0)
+                               sampler=target_sampler, num_workers=0,
+                               **loader_performance_kwargs(str(device), 0))
     preservation_loader = DataLoader(Subset(dataset, preservation_indices), batch_size=batch_size,
-                                     sampler=preserve_sampler, num_workers=0)
+                                     sampler=preserve_sampler, num_workers=0,
+                                     **loader_performance_kwargs(str(device), 0))
     history = []
     with masked_parameters(candidate, masks) as parameters:
-        optimizer = torch.optim.SGD(parameters, lr=learning_rate, momentum=momentum, weight_decay=0)
+        optimizer = torch.optim.SGD(
+            parameters, lr=learning_rate, momentum=momentum, weight_decay=0,
+            fused=device.type == "cuda" and not fail_fast)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        scaler = make_grad_scaler(device, precision)
         for epoch in range(epochs):
             candidate.eval()
-            totals = {"total": 0.0, "ce": 0.0, "preservation_ce": 0.0,
-                      "kd": 0.0, "features": 0.0}
+            totals = {name: torch.zeros((), device=device) for name in
+                      ("total", "ce", "preservation_ce", "kd", "features")}
             count = 0
             for (target_images, target_labels), (preserve_images, preserve_labels) in zip(
                     target_loader, preservation_loader):
-                target_images, target_labels = target_images.to(device), target_labels.to(device)
-                preserve_images, preserve_labels = preserve_images.to(device), preserve_labels.to(device)
+                target_images = move_images(target_images, device, channels_last)
+                target_labels = move_labels(target_labels, device)
+                preserve_images = move_images(preserve_images, device, channels_last)
+                preserve_labels = move_labels(preserve_labels, device)
                 optimizer.zero_grad(set_to_none=True)
-                target_output = candidate(target_images)
-                preserve_output = candidate(preserve_images, return_features=bool(feature_weight))
-                if kd_weight or feature_weight:
-                    with torch.no_grad():
-                        anchor_output = anchor(preserve_images, return_features=bool(feature_weight))
-                else:
-                    anchor_output = preserve_output
-                losses = repair_loss(target_output, target_labels, preserve_output, anchor_output,
-                                     preserve_labels, temperature=temperature,
-                                     kd_weight=kd_weight, feature_weight=feature_weight,
-                                     preservation_ce_weight=preservation_ce_weight,
-                                     feature_stages=feature_stages)
-                if not torch.isfinite(losses["total"]):
+                with autocast_context(device, precision):
+                    target_output = candidate(target_images)
+                    preserve_output = candidate(preserve_images, return_features=bool(feature_weight))
+                    if kd_weight or feature_weight:
+                        with torch.no_grad():
+                            anchor_output = anchor(preserve_images, return_features=bool(feature_weight))
+                    else:
+                        anchor_output = preserve_output
+                    losses = repair_loss(target_output, target_labels, preserve_output, anchor_output,
+                                         preserve_labels, temperature=temperature,
+                                         kd_weight=kd_weight, feature_weight=feature_weight,
+                                         preservation_ce_weight=preservation_ce_weight,
+                                         feature_stages=feature_stages)
+                if fail_fast and not torch.isfinite(losses["total"]):
                     raise FloatingPointError("Non-finite neuron-repair loss")
-                losses["total"].backward()
-                nn.utils.clip_grad_norm_(parameters, float("inf"), error_if_nonfinite=True)
-                optimizer.step()
+                if scaler.is_enabled():
+                    scaler.scale(losses["total"]).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    losses["total"].backward()
+                    if fail_fast:
+                        nn.utils.clip_grad_norm_(parameters, float("inf"), error_if_nonfinite=True)
+                    optimizer.step()
                 count += target_labels.numel()
                 for name, value in losses.items():
-                    totals[name] += value.detach().item() * target_labels.numel()
+                    totals[name] += value.detach() * target_labels.numel()
+            finite = torch.stack([torch.isfinite(value) for value in totals.values()]).all()
+            parameter_finite = torch.stack([
+                torch.isfinite(parameter).all() for parameter in parameters]).all()
+            if not bool((finite & parameter_finite).cpu()):
+                raise FloatingPointError(f"Non-finite neuron-repair state at epoch {epoch + 1}")
             history.append({"epoch": epoch + 1, "learning_rate": optimizer.param_groups[0]["lr"],
-                            **{name: value / count for name, value in totals.items()}})
+                            **{name: value.item() / count for name, value in totals.items()},
+                            "precision": precision,
+                            "grad_scaler_enabled": scaler.is_enabled()})
             scheduler.step()
     candidate.requires_grad_(False).eval()
     verification = assert_only_masked_changes(candidate, before, masks)

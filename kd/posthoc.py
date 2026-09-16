@@ -10,6 +10,8 @@ import math
 import numpy as np
 import torch
 
+from .runtime import autocast_context, move_images
+
 
 def _log_probabilities(logits, temperature):
     z = np.asarray(logits, dtype=np.float64)
@@ -101,16 +103,19 @@ def fit_calibrators(logits, labels, *, temperatures=None, gammas=None):
 
 
 @torch.inference_mode()
-def collect_logits(model, loader, device):
+def collect_logits(model, loader, device, *, precision="float32", channels_last=False):
     previous = model.training
     model.eval()
     logits, labels = [], []
     try:
         for images, targets in loader:
-            logits.append(model(images.to(device)).logits.detach().cpu().numpy())
+            images = move_images(images, device, channels_last)
+            with autocast_context(device, precision):
+                output = model(images).logits
+            logits.append(output.detach().float())
             labels.append(targets.numpy())
     finally:
         model.train(previous)
     if not logits:
         raise ValueError("Cannot collect logits from an empty dataset")
-    return np.concatenate(labels), np.concatenate(logits)
+    return np.concatenate(labels), torch.cat(logits).cpu().numpy()

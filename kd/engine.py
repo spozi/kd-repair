@@ -21,27 +21,25 @@ from .data import build_data
 from .losses import DistillationObjective, StageFeatureLoss
 from .metrics import benchmark, check_budget, evaluate, synchronize
 from .models import VisionModel, create_model
+from .runtime import (autocast_context, configure_accelerator, make_grad_scaler,
+                      move_images, move_labels, prepare_model,
+                      resolve_device as _resolve_device, resolve_precision,
+                      runtime_metadata)
 from .surgery import apply_training_surgery
 
 
-def seed_everything(seed: int) -> None:
+def seed_everything(seed: int, *, deterministic: bool = True) -> None:
     random.seed(seed)
     np.random.seed(seed % 2**32)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
 
 
 def resolve_device(requested: str) -> torch.device:
-    if requested == "auto":
-        requested = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA is not available")
-    if requested == "mps" and not torch.backends.mps.is_available():
-        raise ValueError("MPS is not available")
-    return torch.device(requested)
+    return _resolve_device(requested)
 
 
 class DistillationSystem(nn.Module):
@@ -72,38 +70,65 @@ class DistillationSystem(nn.Module):
 
 
 class Trainer:
-    def __init__(self, system: DistillationSystem, optimizer, device: torch.device):
+    def __init__(self, system: DistillationSystem, optimizer, device: torch.device, *,
+                 precision: str = "float32", channels_last: bool = False,
+                 fail_fast: bool = True):
         self.system, self.optimizer, self.device = system, optimizer, device
+        self.precision = resolve_precision(precision, device)
+        self.channels_last = bool(device.type == "cuda" and channels_last)
+        self.scaler = make_grad_scaler(device, self.precision)
+        self.fail_fast = fail_fast
 
     def train_epoch(self, loader, epoch: int) -> dict:
         self.system.train()
-        sums = {"total": 0.0, "ce": 0.0, "supervised": 0.0, "response": 0.0, "features": 0.0, "calibration": 0.0}
+        sums = {name: torch.zeros((), device=self.device) for name in
+                ("total", "ce", "supervised", "response", "features", "calibration")}
         if self.system.objective.cpc_loss is not None:
-            sums.update(cpc_discrimination=0.0, cpc_exclusion=0.0, cpc_weighted=0.0)
-        count = correct = 0
+            sums.update({name: torch.zeros((), device=self.device) for name in
+                         ("cpc_discrimination", "cpc_exclusion", "cpc_weighted")})
+        count = 0
+        correct = torch.zeros((), dtype=torch.long, device=self.device)
+        parameters = [p for p in self.system.parameters() if p.requires_grad]
         synchronize(self.device)
         start = time.perf_counter()
         for images, labels in loader:
-            images, labels = images.to(self.device), labels.to(self.device)
+            images = move_images(images, self.device, self.channels_last)
+            labels = move_labels(labels, self.device)
             self.optimizer.zero_grad(set_to_none=True)
-            output, losses = self.system(images, labels, epoch)
-            if not torch.isfinite(losses["total"]):
+            with autocast_context(self.device, self.precision):
+                output, losses = self.system(images, labels, epoch)
+            if self.fail_fast and not torch.isfinite(losses["total"]):
                 raise FloatingPointError(f"Non-finite training loss at epoch {epoch + 1}")
-            losses["total"].backward()
-            # Fail before updating weights if gradients overflow.
-            nn.utils.clip_grad_norm_([p for p in self.system.parameters() if p.requires_grad],
-                                     max_norm=float("inf"), error_if_nonfinite=True)
-            self.optimizer.step()
+            if self.scaler.is_enabled():
+                self.scaler.scale(losses["total"]).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                losses["total"].backward()
+                if self.fail_fast:
+                    # Infinite max_norm performs validation without changing gradients.
+                    nn.utils.clip_grad_norm_(parameters, max_norm=float("inf"),
+                                             error_if_nonfinite=True)
+                self.optimizer.step()
             count += labels.numel()
-            correct += output.logits.detach().argmax(1).eq(labels).sum().item()
+            correct += output.logits.detach().argmax(1).eq(labels).sum()
             for name, value in losses.items():
-                sums[name] += value.detach().item() * labels.numel()
+                sums[name] += value.detach() * labels.numel()
         synchronize(self.device)
         if not count:
             raise ValueError("Cannot train on an empty dataset")
+        finite = torch.stack([torch.isfinite(value) for value in sums.values()]).all()
+        parameter_finite = torch.stack([
+            torch.isfinite(parameter).all() for parameter in self.system.parameters()
+            if parameter.requires_grad]).all()
+        if not bool((finite & parameter_finite).cpu()):
+            raise FloatingPointError(f"Non-finite training state at epoch {epoch + 1}")
         seconds = time.perf_counter() - start
-        return {**{name: value / count for name, value in sums.items()}, "accuracy": correct / count,
-                "samples": count, "seconds": seconds, "samples_per_second": count / seconds}
+        return {**{name: value.item() / count for name, value in sums.items()},
+                "accuracy": correct.item() / count,
+                "samples": count, "seconds": seconds, "samples_per_second": count / seconds,
+                "precision": self.precision,
+                "grad_scaler_enabled": self.scaler.is_enabled()}
 
 
 def _resume_signature(config: dict) -> dict:
@@ -114,9 +139,13 @@ def _resume_signature(config: dict) -> dict:
 
 def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> dict:
     config.validate()
-    seed_everything(config.train.seed)
-    torch.set_num_threads(config.train.threads)
     device = resolve_device(config.train.device)
+    deterministic = config.train.cuda_mode == "deterministic"
+    seed_everything(config.train.seed, deterministic=deterministic)
+    configure_accelerator(device, config.train.cuda_mode)
+    torch.set_num_threads(config.train.threads)
+    runtime = runtime_metadata(device, config.train.precision, config.train.cuda_mode,
+                               config.train.channels_last)
     data = build_data(config.data, config.train, include_test=False)
     data, surgery_info = apply_training_surgery(data, config)
     student = create_model(config.student.name, config.data.num_classes)
@@ -135,9 +164,11 @@ def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> di
         if teacher_state.get("epoch", -1) < 0:
             raise ValueError("Teacher checkpoint must come from a completed training epoch")
         teacher_hash = fingerprint(config.teacher.checkpoint)
-        teacher.to(device).eval()
+        prepare_model(teacher, device, config.train.channels_last).eval()
         teacher_tensor_hash = tensor_state_fingerprint(teacher.state_dict())
-        teacher_info = evaluate(teacher, data.val, device)
+        teacher_info = evaluate(
+            teacher, data.val, device, precision=config.train.precision,
+            channels_last=config.train.channels_last)
         teacher_count = sum(p.numel() for p in teacher.parameters())
         ratio = teacher_count / sum(p.numel() for p in student.parameters())
         teacher_info.update(parameters=teacher_count, capacity_ratio=ratio, checkpoint_sha256=teacher_hash)
@@ -155,12 +186,17 @@ def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> di
     objective = DistillationObjective(config.distillation, feature_loss, calibration_loss, adaptive_loss,
                                       cpc_loss=cpc_loss)
     controller = CalibrationController(config.calibration)
-    system = DistillationSystem(student, teacher, objective).to(device)
-    optimizer = torch.optim.SGD([p for p in system.parameters() if p.requires_grad],
-                                 lr=config.train.learning_rate, momentum=config.train.momentum,
-                                 weight_decay=config.train.weight_decay)
+    system = DistillationSystem(student, teacher, objective)
+    prepare_model(system, device, config.train.channels_last)
+    optimizer = torch.optim.SGD(
+        [p for p in system.parameters() if p.requires_grad],
+        lr=config.train.learning_rate, momentum=config.train.momentum,
+        weight_decay=config.train.weight_decay,
+        fused=device.type == "cuda" and not deterministic)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.train.epochs)
-    trainer = Trainer(system, optimizer, device)
+    trainer = Trainer(system, optimizer, device, precision=config.train.precision,
+                      channels_last=config.train.channels_last,
+                      fail_fast=device.type != "cuda" or deterministic)
     directory = Path(config.output_dir) / config.name
     history, best_accuracy, start_epoch = [], -1.0, 0
     loaders = {"train": data.train, "val": data.val}
@@ -168,7 +204,8 @@ def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> di
         loaders["test"] = data.test
     # Reset augmentation randomness after constructing different teacher/loss
     # variants, so ablations start from identical students and image streams.
-    seed_everything(config.train.seed)
+    seed_everything(config.train.seed, deterministic=deterministic)
+    configure_accelerator(device, config.train.cuda_mode)
     if resume:
         state = load_model_checkpoint(student, resume, student_metadata)
         if state.get("kind") != "training":
@@ -184,6 +221,8 @@ def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> di
             raise ValueError("Adaptive focal controller state does not match the resumed epoch")
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
+        if trainer.scaler.is_enabled() and state.get("amp_scaler"):
+            trainer.scaler.load_state_dict(state["amp_scaler"])
         history, best_accuracy = state["history"], state["best_accuracy"]
         if config.calibration.enabled and "calibration_controller" not in state:
             raise ValueError("Calibration resume requires saved controller state")
@@ -206,11 +245,15 @@ def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> di
         training = trainer.train_epoch(data.train, epoch)
         adaptive_decision = None
         if adaptive_loss is None:
-            validation = evaluate(student, data.val, device)
+            validation = evaluate(
+                student, data.val, device, precision=config.train.precision,
+                channels_last=config.train.channels_last)
         else:
             # Reuse the student validation pass; the teacher/test never drive gamma.
             feedback = []
             validation = evaluate(student, data.val, device,
+                                  precision=config.train.precision,
+                                  channels_last=config.train.channels_last,
                                   confidence_observer=lambda confidence, correct: feedback.append((confidence, correct)))
             adaptive_decision = adaptive_loss.controller.observe(
                 epoch + 1, torch.cat([v[0] for v in feedback]), torch.cat([v[1] for v in feedback]))
@@ -228,6 +271,7 @@ def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> di
                  "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                  "best_accuracy": best_accuracy, "history": history, "config": config.to_dict(),
                  "teacher_sha256": teacher_hash, "rng": capture_rng(loaders),
+                 "amp_scaler": trainer.scaler.state_dict() if trainer.scaler.is_enabled() else None,
                  "surgery_plan_sha256": surgery_info.get("plan_sha256"),
                  "calibration_controller": controller.state_dict()}
         if improved:
@@ -238,14 +282,18 @@ def run_experiment(config: ExperimentConfig, *, resume: str | None = None) -> di
     best = load_model_checkpoint(student, directory / "best.pt", student_metadata)
     if teacher is not None and tensor_state_fingerprint(teacher.state_dict()) != teacher_tensor_hash:
         raise RuntimeError("Teacher tensors changed during student training")
-    quality = evaluate(student, data.val, device)
-    cost = benchmark(student, config.data.image_size, device, config.benchmark)
+    quality = evaluate(student, data.val, device, precision=config.train.precision,
+                       channels_last=config.train.channels_last)
+    cost = benchmark(student, config.data.image_size, device, config.benchmark,
+                     precision=config.train.precision,
+                     channels_last=config.train.channels_last)
     summary = {"name": config.name, "method": config.distillation.method, "seed": config.train.seed,
                "initial_student_sha256": initial_student_sha256,
                "supervised_loss": config.supervised_loss.method,
                "data_source": config.data.source, "data": data.provenance,
                "surgery": surgery_info,
                "synthetic_smoke_only": config.data.source == "synthetic",
+               "runtime": runtime,
                "best_epoch": best["epoch"] + 1, "validation": quality, "teacher": teacher_info,
                "calibration_controller": controller.state_dict(),
                "inference": cost, "deployment_budget": check_budget(cost, config.benchmark),
@@ -271,17 +319,26 @@ def evaluate_checkpoint(config: ExperimentConfig, checkpoint: str, split: str = 
     config.validate(require_teacher=False)
     if split not in {"val", "test"}:
         raise ValueError("Evaluation split must be val or test")
-    seed_everything(config.train.seed)
-    torch.set_num_threads(config.train.threads)
     device = resolve_device(config.train.device)
+    seed_everything(config.train.seed,
+                    deterministic=config.train.cuda_mode == "deterministic")
+    configure_accelerator(device, config.train.cuda_mode)
+    torch.set_num_threads(config.train.threads)
     data = build_data(config.data, config.train, include_test=split == "test")
     loader = getattr(data, split)
     if loader is None:
         raise ValueError(f"Dataset has no {split} split")
     model = create_model(config.student.name, config.data.num_classes)
     load_model_checkpoint(model, checkpoint, metadata(config.student.name, data.classes, config.data.image_size, config.data.source))
-    model.to(device)
-    cost = benchmark(model, config.data.image_size, device, config.benchmark)
-    return {"split": split, "quality": evaluate(model, loader, device), "inference": cost,
+    prepare_model(model, device, config.train.channels_last)
+    cost = benchmark(model, config.data.image_size, device, config.benchmark,
+                     precision=config.train.precision,
+                     channels_last=config.train.channels_last)
+    quality = evaluate(model, loader, device, precision=config.train.precision,
+                       channels_last=config.train.channels_last)
+    return {"split": split, "quality": quality, "inference": cost,
             "deployment_budget": check_budget(cost, config.benchmark),
+            "runtime": runtime_metadata(device, config.train.precision,
+                                        config.train.cuda_mode,
+                                        config.train.channels_last),
             "synthetic_smoke_only": config.data.source == "synthetic"}

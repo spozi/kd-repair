@@ -60,7 +60,7 @@ def campaign_plan(output: str | Path, data_root: str | Path,
             name: fingerprint(Path(__file__).resolve().parent / name)
             for name in ("config.py", "data.py", "models.py", "neuron_surgery.py",
                          "neuron_surgery_study.py", "neuron_surgery_baselines.py",
-                         "neuron_surgery_campaign.py")
+                         "runtime.py", "neuron_surgery_campaign.py")
         },
     }
 
