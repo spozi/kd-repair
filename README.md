@@ -183,6 +183,17 @@ python -m kd neuron-surgery-campaign \
 
 Individual generalized studies use `--study-config configs/neuron_surgery/NAME.json`. Missing matched controls can be generated with `python -m kd neuron-surgery-baselines --study-config ...`.
 
+To run Experiment 1 across CIFAR-10, CIFAR-100, SVHN, CINIC-10, and GTSRB at
+balanced, IF10, IF50, and IF100 profiles on four GPUs:
+
+```bash
+scripts/run_gpu_experiment1_4gpu.sh --gpu-ids 0,1,2,3
+```
+
+The launcher freezes a 20-job plan, prepares each dataset once, dynamically
+schedules isolated jobs, resumes validated artifacts, and writes a matrix-level
+summary without pooling samples across datasets.
+
 To compare direct student surgery without distillation against both supervised and KD controls, run:
 
 ```bash

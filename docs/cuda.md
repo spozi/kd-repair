@@ -51,6 +51,30 @@ the GPU model.
 
 ## Running studies
 
+For the fresh, sealed CIFAR-10-LT factor-100 Experiment 1 workflow, use the server launcher:
+
+```bash
+scripts/run_gpu_experiment1.sh --device cuda:0
+```
+
+The script configures and verifies the private dataset cache, runs the CUDA preflight and tests,
+generates matched baselines, then runs neuron repair and downstream KD. It logs to `logs/` and can be
+rerun with the same arguments to resume validated artifacts. Run
+`scripts/run_gpu_experiment1.sh --help` for dry-run, stage-only, path, and registry overrides. Install
+a CUDA-enabled PyTorch build in the active environment before invoking it.
+
+For a four-GPU server, run the complete five-dataset matrix:
+
+```bash
+scripts/run_gpu_experiment1_4gpu.sh --gpu-ids 0,1,2,3
+```
+
+The default matrix contains CIFAR-10, CIFAR-100, SVHN, CINIC-10, and GTSRB under balanced, IF10,
+IF50, and IF100 profiles. Shared dataset preparation, CUDA checks, and tests run once. A dynamic queue
+keeps four isolated workers active, starts the next study when a GPU becomes free, and writes a
+dataset/profile report under `runs/experiment1-multidataset/`. Use `--datasets` or `--profiles` for a
+smaller matrix. Every job can resume independently.
+
 Use an indexed device directly:
 
 ```bash

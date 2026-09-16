@@ -35,7 +35,7 @@ from .runtime import (accelerator_workers, configure_accelerator,
                       loader_performance_kwargs, prepare_model, runtime_metadata)
 
 
-STUDY_VERSION = 3
+STUDY_VERSION = 4
 DEFAULT_SEEDS = (42, 43, 44)
 REPAIR_SEED = 2026
 CHANNEL_BUDGETS = (2, 4, 8)
@@ -64,7 +64,8 @@ class NeuronSurgerySpec:
     split_seed: int = 2026
     confirmation_fraction: float = 0.0
     training_epochs: int = 81
-    target_classes: tuple[int, ...] = TAIL_CLASSES
+    target_classes: tuple[int, ...] | None = TAIL_CLASSES
+    target_class_policy: str = "explicit"
     target_fraction: float = 0.2
     companion_count: int = 5
     stages: tuple[str, ...] | None = None
@@ -87,6 +88,8 @@ class NeuronSurgerySpec:
     dataset_num_classes: int = 10
     dataset_image_size: int = 32
     dataset_version: str | None = None
+    dataset_profile: str | None = None
+    allow_sparse_class_fallback: bool = False
 
     def validate(self) -> None:
         if not self.name or Path(self.name).name != self.name:
@@ -119,13 +122,30 @@ class NeuronSurgerySpec:
             raise ValueError("Study channel budgets must be unique increasing positive integers")
         if not self.learning_rates or any(value <= 0 for value in self.learning_rates):
             raise ValueError("Study learning rates must be positive")
-        if not self.target_classes or len(set(self.target_classes)) != len(self.target_classes):
-            raise ValueError("Study target classes must be nonempty and unique")
+        if self.target_class_policy not in {"explicit", "frequency_tail", "all"}:
+            raise ValueError("Target class policy must be explicit, frequency_tail, or all")
+        if self.target_class_policy == "explicit":
+            if not self.target_classes or len(set(self.target_classes)) != len(self.target_classes):
+                raise ValueError("Explicit target classes must be nonempty and unique")
+        elif self.target_classes is not None:
+            raise ValueError("Derived target class policies require target_classes=null")
+        if self.target_class_policy == "frequency_tail" and self.imbalance_factor == 1:
+            raise ValueError("frequency_tail requires an imbalanced dataset profile")
         if (self.dataset_source not in {"cifar10", "cifar100", "svhn", "cinic10", "gtsrb"}
                 or self.dataset_num_classes < 2 or self.dataset_image_size != 32):
             raise ValueError("Study dataset must be a supported 32x32 classification source")
-        if any(label < 0 or label >= self.dataset_num_classes for label in self.target_classes):
+        if (self.target_classes is not None
+                and any(label < 0 or label >= self.dataset_num_classes
+                        for label in self.target_classes)):
             raise ValueError("Study target classes must belong to the configured dataset")
+        profiles = {"balanced": 1.0, "lt-if10": 10.0, "lt-if50": 50.0, "lt-if100": 100.0}
+        if self.dataset_profile is not None:
+            if self.dataset_profile not in profiles:
+                raise ValueError(f"Unknown dataset profile {self.dataset_profile}")
+            if profiles[self.dataset_profile] != self.imbalance_factor:
+                raise ValueError("Dataset profile and imbalance factor disagree")
+        if not isinstance(self.allow_sparse_class_fallback, bool):
+            raise ValueError("allow_sparse_class_fallback must be a boolean")
         for template in (self.teacher_run, self.student_run_template.format(seed=self.student_seeds[0])):
             if not template or Path(template).name != template:
                 raise ValueError("Study baseline run names must be single directory names")
@@ -147,6 +167,25 @@ def neuron_surgery_spec_from_dict(raw: dict) -> NeuronSurgerySpec:
 
 def load_neuron_surgery_spec(path: str | Path) -> NeuronSurgerySpec:
     return neuron_surgery_spec_from_dict(_read(path))
+
+
+def resolved_dataset_profile(spec: NeuronSurgerySpec) -> str:
+    """Return the catalog profile while preserving legacy imbalance-factor specs."""
+    return spec.dataset_profile or "balanced"
+
+
+def resolve_target_classes(spec: NeuronSurgerySpec, train_counts) -> tuple[int, ...]:
+    """Freeze explicit, all-class, or frequency-defined target classes."""
+    counts = tuple(int(value) for value in train_counts)
+    if len(counts) != spec.dataset_num_classes or min(counts) < 1:
+        raise ValueError("Training counts must contain every configured class")
+    if spec.target_class_policy == "explicit":
+        return tuple(spec.target_classes or ())
+    if spec.target_class_policy == "all":
+        return tuple(range(spec.dataset_num_classes))
+    count = (spec.dataset_num_classes + 1) // 2
+    ranked = sorted(range(spec.dataset_num_classes), key=lambda label: (counts[label], label))
+    return tuple(ranked[:count])
 
 
 def _json(value):
@@ -259,12 +298,13 @@ def _load_inputs(baseline: str | Path, seeds: tuple[int, ...],
     factor = ({"lt-if10": 10.0, "lt-if50": 50.0, "lt-if100": 100.0}
               .get(teacher_config.data.dataset_profile, teacher_config.data.imbalance_factor))
     teacher_recipe = (teacher_config.data.source, teacher_config.data.num_classes,
-                      teacher_config.data.image_size, teacher_config.data.dataset_version, factor,
+                      teacher_config.data.image_size, teacher_config.data.dataset_version,
+                      teacher_config.data.dataset_profile, factor,
                       teacher_config.data.split_seed, teacher_config.data.confirmation_fraction,
                       teacher_config.student.name, teacher_config.distillation.method,
                       teacher_config.train.seed, teacher_config.train.epochs)
     expected_teacher = (spec.dataset_source, spec.dataset_num_classes, spec.dataset_image_size,
-                        spec.dataset_version,
+                        spec.dataset_version, resolved_dataset_profile(spec),
                         spec.imbalance_factor, spec.split_seed,
                         spec.confirmation_fraction, spec.teacher_model, "supervised",
                         spec.teacher_seed, spec.training_epochs)
@@ -313,8 +353,8 @@ def _protocol(baseline: Path, output: Path, device: str, teacher_config,
         "method": ("AI-Lancet-inspired same-class companion channel repair followed by KD"
                    if spec.downstream_kd else
                    f"AI-Lancet-inspired direct {spec.repair_subject} channel repair"),
-        "scope": (f"{spec.teacher_model} on factor-{spec.imbalance_factor:g} "
-                  f"{spec.dataset_source}-LT"),
+        "scope": (f"{spec.teacher_model} on {resolved_dataset_profile(spec)} "
+                  f"{spec.dataset_source}"),
         "study": spec.to_dict(),
         "baseline": str(baseline), "output": str(output), "device": device,
         "teacher": {"config": teacher_config.to_dict(),
@@ -324,10 +364,13 @@ def _protocol(baseline: Path, output: Path, device: str, teacher_config,
                                            "checkpoint_sha256": row["checkpoint_sha256"],
                                            "initial_student_sha256": row["summary"]["initial_student_sha256"]}
                               for seed, row in students.items()},
-        "target_selection": {"classes": list(spec.target_classes),
+        "target_selection": {"classes": (list(spec.target_classes)
+                                                   if spec.target_classes is not None else None),
+                             "class_policy": spec.target_class_policy,
                              "hard_fraction": spec.target_fraction,
                              "policy": "all mistakes plus highest-NLL correct rows to each class quota"},
         "companions": {"count": spec.companion_count, "metric": "cosine_distance",
+                       "sparse_class_fallback": spec.allow_sparse_class_fallback,
                        "embedding": f"global-average-pooled normalized {stages[-1]}"},
         "localization": {"stages": list(stages), "score_mode": spec.score_mode,
                          "score": ("mean absolute companion feature difference times absolute error-margin gradient"
@@ -347,16 +390,17 @@ def _protocol(baseline: Path, output: Path, device: str, teacher_config,
                    "kd_weight": spec.kd_weight, "feature_weight": spec.feature_weight,
                    "preservation_ce_weight": spec.preservation_ce_weight,
                    "loss": "CE(target)+weighted CE(preservation)+weighted KD_T4(anchor,preservation)+weighted late-stage feature preservation"},
-        "teacher_selection": {"split": "long-tailed validation", "primary": "tail_macro_recall",
+        "teacher_selection": {"split": "development validation",
+                              "primary": "target_macro_recall",
                               "overall_accuracy_guardrail": -0.005,
-                              "tie_breaks": ["tail_balanced_nll", "fewer_channels", "lower_learning_rate"],
-                              "requires_strict_tail_improvement": True,
+                              "tie_breaks": ["target_balanced_nll", "fewer_channels", "lower_learning_rate"],
+                              "requires_strict_target_improvement": True,
                               "on_failure": "stop before student KD and test construction"},
         "student_kd": {"enabled": spec.downstream_kd, "seeds": list(spec.student_seeds),
                        "epochs": spec.training_epochs, "method": "kd",
                        "temperature": 4.0, "weight": 0.5, "warmup_epochs": 5,
                        "feature_weight": 0.0, "sample_surgery": "none"},
-        "success": {"mean_tail_recall_delta": 0.01, "positive_seed_count": 2,
+        "success": {"mean_target_recall_delta": 0.01, "positive_seed_count": 2,
                     "mean_accuracy_delta_guardrail": -0.005},
         "statistics": {"paired_bootstrap_repetitions": BOOTSTRAP_REPETITIONS,
                        "seed": STATISTICS_SEED},
@@ -383,11 +427,15 @@ def _tail_metrics(labels, probabilities, target_classes=TAIL_CLASSES) -> dict:
     for label in target_classes:
         selected = labels == label
         if not selected.any():
-            raise ValueError(f"Evaluation has no samples for tail class {label}")
+            raise ValueError(f"Evaluation has no samples for target class {label}")
         recalls[str(label)] = float((predictions[selected] == label).mean())
         nlls[str(label)] = float(-np.log(np.maximum(probabilities[selected, label], 1e-300)).mean())
-    return {"tail_macro_recall": float(np.mean(list(recalls.values()))),
-            "tail_balanced_nll": float(np.mean(list(nlls.values()))),
+    macro_recall = float(np.mean(list(recalls.values())))
+    balanced_nll = float(np.mean(list(nlls.values())))
+    return {"target_macro_recall": macro_recall, "target_balanced_nll": balanced_nll,
+            "target_recall_by_label": recalls, "target_nll_by_label": nlls,
+            "tail_macro_recall": macro_recall,
+            "tail_balanced_nll": balanced_nll,
             "tail_recall_by_label": recalls, "tail_nll_by_label": nlls}
 
 
@@ -416,7 +464,8 @@ def _candidate_complete(path: Path, identity: dict):
 def _train_candidate(directory: Path, identity: dict, teacher_config, teacher_checkpoint: Path,
                      anchor: VisionModel, dataset, labels, target_indices, preservation_indices,
                      channels, device, classes, validation_loader, localization_sha256,
-                     budget: int, learning_rate: float, spec: NeuronSurgerySpec) -> dict:
+                     budget: int, learning_rate: float, spec: NeuronSurgerySpec,
+                     target_classes: tuple[int, ...]) -> dict:
     cached = _candidate_complete(directory, identity)
     if cached is not None:
         state = torch.load(directory / "teacher.pt", map_location="cpu", weights_only=True)
@@ -440,7 +489,7 @@ def _train_candidate(directory: Path, identity: dict, teacher_config, teacher_ch
         fail_fast=(device.type != "cuda"
                    or teacher_config.train.cuda_mode == "deterministic"))
     validation = _validation_report(
-        candidate, validation_loader, device, classes, spec.target_classes,
+        candidate, validation_loader, device, classes, target_classes,
         precision=teacher_config.train.precision,
         channels_last=teacher_config.train.channels_last)
     checkpoint = {**metadata(spec.teacher_model, classes, teacher_config.data.image_size,
@@ -548,14 +597,14 @@ def _mean_std(values):
 
 def _render_report(comparison: dict) -> str:
     dataset = comparison.get("study", {}).get("dataset_source", "cifar10")
-    title = f"# {dataset} long-tailed neuron surgery and KD"
+    title = f"# {dataset} neuron surgery and KD"
     if comparison["status"] in {"repair_only_complete", "student_repair_complete"}:
         delta = comparison["validation_delta"]
-        return (f"# {dataset} long-tailed neuron-surgery component ablation\n\n"
+        return (f"# {dataset} neuron-surgery component ablation\n\n"
                 f"Study: **{comparison['study']['name']}**.\n\n"
                 f"Validation accuracy delta: **{delta['accuracy']:+.4f}**.  \n"
-                f"Validation tail-recall delta: **{delta['tail_macro_recall']:+.4f}**.  \n"
-                f"Validation tail-NLL delta: **{delta['tail_balanced_nll']:+.4f}**.\n")
+                f"Validation target-recall delta: **{delta['target_macro_recall']:+.4f}**.  \n"
+                f"Validation target-NLL delta: **{delta['target_balanced_nll']:+.4f}**.\n")
     if comparison["status"] != "complete":
         return (title + "\n\n"
                 f"Status: **{comparison['status']}**.\n\n"
@@ -563,14 +612,14 @@ def _render_report(comparison: dict) -> str:
     aggregate = comparison["aggregate"]
     lines = [title, "",
              f"Study: **{comparison['study']['name']}**.", "",
-             ("AI-Lancet-inspired channel repair was selected on the long-tailed validation split "
+             ("AI-Lancet-inspired channel repair was selected on the development split "
               f"before the {comparison['evaluation_split']} split was loaded."), "",
-             "| Seed | Baseline acc. | Repaired-teacher KD acc. | Acc. delta | Tail recall delta |",
+             "| Seed | Baseline acc. | Repaired-teacher KD acc. | Acc. delta | Target recall delta |",
              "|---:|---:|---:|---:|---:|"]
     for row in comparison["students"]:
         lines.append(f"| {row['seed']} | {row['baseline']['accuracy']:.4f} | {row['candidate']['accuracy']:.4f} | "
-                     f"{row['accuracy_delta']:+.4f} | {row['tail_recall_delta']:+.4f} |")
-    lines.extend(["", f"Mean tail-recall delta: **{aggregate['tail_recall_delta']['mean']:+.4f}**.",
+                     f"{row['accuracy_delta']:+.4f} | {row['target_recall_delta']:+.4f} |")
+    lines.extend(["", f"Mean target-recall delta: **{aggregate['target_recall_delta']['mean']:+.4f}**.",
                   f"Mean accuracy delta: **{aggregate['accuracy_delta']['mean']:+.4f}**.",
                   f"Success rule passed: **{comparison['success']['passed']}**.", "",
                   comparison["evaluation_interpretation"], ""])
@@ -632,6 +681,15 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
     if (spec.expected_train_counts is not None
             and tuple(diagnostic_data.provenance["train_per_class"]) != spec.expected_train_counts):
         raise ValueError("Frozen long-tail training counts changed")
+    target_classes = resolve_target_classes(
+        spec, diagnostic_data.provenance["train_per_class"])
+    target_class_plan = {
+        "policy": spec.target_class_policy,
+        "classes": list(target_classes),
+        "train_per_class": diagnostic_data.provenance["train_per_class"],
+        "tie_break": "dataset label index",
+    }
+    _freeze(directory / "target_class_plan.json", target_class_plan)
     teacher = create_model(spec.teacher_model, teacher_config.data.num_classes)
     stages = _configured_stages(spec)
     if stages != localization_stages(teacher):
@@ -645,7 +703,8 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
     prepare_model(teacher, resolved_device,
                   teacher_config.train.channels_last).requires_grad_(False).eval()
     data_identity = {"protocol_sha256": protocol_sha256, "teacher_sha256": fingerprint(teacher_checkpoint),
-                     "data": diagnostic_data.provenance, "classes": diagnostic_data.classes}
+                     "data": diagnostic_data.provenance, "classes": diagnostic_data.classes,
+                     "target_classes": list(target_classes)}
 
     def diagnostics_compute():
         records, embeddings = collect_teacher_diagnostics(teacher, diagnostic_data.train, resolved_device)
@@ -660,18 +719,30 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
     targets_identity = {**data_identity, "diagnostics_sha256": fingerprint(directory / "diagnostics.npz")}
 
     def targets_compute():
-        targets = select_hard_tail_targets(records, spec.target_classes,
+        targets = select_hard_tail_targets(records, target_classes,
                                            fraction=spec.target_fraction)
         counts = tuple(sum(row["true_label"] == label for row in targets)
-                       for label in spec.target_classes)
+                       for label in target_classes)
         if spec.expected_target_counts is not None and counts != spec.expected_target_counts:
             raise ValueError(f"Hard-target counts changed: {counts}")
         indices = [row["index"] for row in targets]
-        preservation = select_preservation_indices(records, indices, seed=REPAIR_SEED)
+        preservation = select_preservation_indices(
+            records, indices, seed=REPAIR_SEED,
+            allow_sparse_fallback=spec.allow_sparse_class_fallback)
         preservation_pool = [row["index"] for row in records
                              if row["correct"] and row["index"] not in set(indices)]
+        if not preservation_pool and spec.allow_sparse_class_fallback:
+            preservation_pool = [row["index"] for row in records
+                                 if row["index"] not in set(indices)]
+        if not preservation_pool:
+            raise ValueError("Repair requires at least one non-target preservation example")
+        preservation_classes = sorted({records[index]["true_label"] for index in preservation})
         return {"targets": targets, "target_counts": list(counts),
+                "target_classes": list(target_classes),
                 "causal_preservation_indices": preservation,
+                "causal_preservation_classes": preservation_classes,
+                "causal_preservation_omitted_classes": sorted(
+                    set(range(spec.dataset_num_classes)) - set(preservation_classes)),
                 "training_preservation_indices": preservation_pool}
 
     target_plan = _stage_json(directory / "targets.json", targets_identity, targets_compute)
@@ -681,7 +752,8 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
     companions = _stage_json(
         directory / "companions.json", companion_identity,
         lambda: build_companion_records(records, diagnostics["embeddings"],
-                                        target_plan["targets"], companions=spec.companion_count))
+                                        target_plan["targets"], companions=spec.companion_count,
+                                        allow_sparse_fallback=spec.allow_sparse_class_fallback))
 
     score_identity = {"protocol_sha256": protocol_sha256,
                       "companions_sha256": fingerprint(directory / "companions.json"),
@@ -696,7 +768,7 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
     consensus = _stage_json(
         directory / "consensus_scores.json", consensus_identity,
         lambda: consensus_channel_ranking(
-            scores, target_classes=spec.target_classes, repetitions=20, seed=REPAIR_SEED,
+            scores, target_classes=target_classes, repetitions=20, seed=REPAIR_SEED,
             top_fraction=0.25, stability_threshold=0.7, stages=stages))
 
     target_loader = DataLoader(Subset(diagnostic_data.train.dataset,
@@ -714,7 +786,7 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
         if spec.causal_validation:
             return causal_channel_validation(
                 teacher, target_loader, preservation_loader, consensus, resolved_device,
-                target_classes=spec.target_classes, accuracy_guardrail=0.005)
+                target_classes=target_classes, accuracy_guardrail=0.005)
         ranking = [{"stage": row["stage"], "channel": row["channel"]}
                    for row in consensus["channels"] if row["eligible"]]
         return {"performed": False, "reason": "causal_validation_disabled",
@@ -737,18 +809,20 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
     if not localization["available_channel_budgets"]:
         comparison = {"status": "no_repair_selected",
                       "reason": "Too few channels passed the configured localization guardrails.",
-                      "protocol_sha256": protocol_sha256}
+                      "protocol_sha256": protocol_sha256,
+                      "target_classes": list(target_classes)}
         write_json(directory / "comparison.json", comparison)
         _freeze_text(directory / "report.md", _render_report(comparison))
         _write_report_manifest(directory, protocol_sha256,
                                ["comparison.json", "report.md", "targets.json", "companions.json",
+                                "target_class_plan.json",
                                 "differential_scores.npz", "differential_scores.json",
                                 "consensus_scores.json", "causal_ablation.json", "localization.json"])
         return comparison
 
     original_validation = _validation_report(
         teacher, diagnostic_data.val, resolved_device, diagnostic_data.classes,
-        spec.target_classes, precision=teacher_config.train.precision,
+        target_classes, precision=teacher_config.train.precision,
         channels_last=teacher_config.train.channels_last)
     _freeze(directory / "teacher_validation_baseline.json", original_validation)
     augmented_data = build_data(teacher_config.data,
@@ -772,16 +846,16 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
                 [row["index"] for row in target_plan["targets"]],
                 target_plan["training_preservation_indices"], channels, resolved_device,
                 diagnostic_data.classes, diagnostic_data.val, localization_sha256,
-                budget, learning_rate, spec)
+                budget, learning_rate, spec, target_classes)
             candidates.append(result)
             write_json(directory / "progress.json", {"phase": "teacher_repair",
                                                        "completed": [row["checkpoint"] for row in candidates]})
     _freeze(directory / "candidate_results.json", candidates)
     eligible = [row for row in candidates
                 if row["validation"]["accuracy"] >= original_validation["accuracy"] - 0.005
-                and row["validation"]["tail_macro_recall"] > original_validation["tail_macro_recall"]]
-    eligible.sort(key=lambda row: (-row["validation"]["tail_macro_recall"],
-                                   row["validation"]["tail_balanced_nll"], row["budget"],
+                and row["validation"]["target_macro_recall"] > original_validation["target_macro_recall"]]
+    eligible.sort(key=lambda row: (-row["validation"]["target_macro_recall"],
+                                   row["validation"]["target_balanced_nll"], row["budget"],
                                    row["learning_rate"]))
     selection = {"protocol_sha256": protocol_sha256, "localization_sha256": localization_sha256,
                  "baseline_validation": original_validation,
@@ -790,8 +864,10 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
     _freeze(directory / "teacher_selection.json", selection)
     if not eligible:
         comparison = {"status": "no_repair_selected",
-                      "reason": "No repaired teacher strictly improved validation tail recall within the 0.5-point accuracy guardrail.",
-                      "protocol_sha256": protocol_sha256, "teacher_selection": selection}
+                      "reason": "No repaired teacher strictly improved validation target recall within the 0.5-point accuracy guardrail.",
+                      "protocol_sha256": protocol_sha256,
+                      "target_classes": list(target_classes),
+                      "teacher_selection": selection}
         write_json(directory / "comparison.json", comparison)
         _freeze_text(directory / "report.md", _render_report(comparison))
         candidate_files = []
@@ -801,7 +877,8 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
                                    ("teacher.pt", "history.json", "result.json", "completion.json"))
         _write_report_manifest(directory, protocol_sha256,
                                ["comparison.json", "report.md", "teacher_selection.json",
-                                "candidate_results.json", "localization.json", *candidate_files])
+                                "candidate_results.json", "localization.json",
+                                "target_class_plan.json", *candidate_files])
         return comparison
 
     selected = eligible[0]
@@ -825,7 +902,8 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
         comparison = {
             "status": ("student_repair_complete" if direct_student else "repair_only_complete"),
             "protocol_sha256": protocol_sha256,
-            "study": spec.to_dict(), "teacher_selection": selection,
+            "study": spec.to_dict(), "target_classes": list(target_classes),
+            "teacher_selection": selection,
             "validation_delta": {
                 "accuracy": (selected["validation"]["accuracy"]
                              - original_validation["accuracy"]),
@@ -833,6 +911,10 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
                                       - original_validation["tail_macro_recall"]),
                 "tail_balanced_nll": (selected["validation"]["tail_balanced_nll"]
                                       - original_validation["tail_balanced_nll"]),
+                "target_macro_recall": (selected["validation"]["target_macro_recall"]
+                                        - original_validation["target_macro_recall"]),
+                "target_balanced_nll": (selected["validation"]["target_balanced_nll"]
+                                        - original_validation["target_balanced_nll"]),
             },
             "reason": ("Direct student repair selected on validation; final evaluation is delegated to the matched comparison."
                        if direct_student else
@@ -849,7 +931,7 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
             directory, protocol_sha256,
             ["comparison.json", "report.md", "teacher_selection.json", "teacher_repaired.pt",
              "teacher_repaired.json", "candidate_results.json", "localization.json",
-             *candidate_files])
+             "target_class_plan.json", *candidate_files])
         return comparison
 
     repaired_configs = {}
@@ -898,7 +980,7 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
             identity, model, evaluation_loader, evaluation_data.classes)
         teacher_rows.append((condition, y, p,
                              _quality_report(directory / "teacher_evaluation" / condition, y, p,
-                                             evaluation_data.classes, spec.target_classes)))
+                                             evaluation_data.classes, target_classes)))
     if not np.array_equal(teacher_rows[0][1], teacher_rows[1][1]):
         raise ValueError("Teacher evaluation labels differ")
     teacher_comparison = {"baseline": teacher_rows[0][3], "candidate": teacher_rows[1][3],
@@ -929,13 +1011,15 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
                 "predictions.npz", identity, model, evaluation_loader, evaluation_data.classes)
             values.append((y, p, _quality_report(
                 directory / "student_evaluation" / f"seed{seed}" / condition,
-                y, p, evaluation_data.classes, spec.target_classes)))
+                y, p, evaluation_data.classes, target_classes)))
         if not np.array_equal(values[0][0], values[1][0]):
             raise ValueError(f"Seed {seed} paired evaluation labels differ")
+        target_delta = (values[1][2]["target_macro_recall"]
+                        - values[0][2]["target_macro_recall"])
         student_rows.append({"seed": seed, "baseline": values[0][2], "candidate": values[1][2],
                              "accuracy_delta": values[1][2]["accuracy"] - values[0][2]["accuracy"],
-                             "tail_recall_delta": values[1][2]["tail_macro_recall"]
-                                                  - values[0][2]["tail_macro_recall"],
+                             "target_recall_delta": target_delta,
+                             "tail_recall_delta": target_delta,
                              "paired_accuracy": paired_comparison(values[0][0], values[0][1], values[1][1],
                                                                    seed=STATISTICS_SEED,
                                                                    repetitions=BOOTSTRAP_REPETITIONS),
@@ -944,16 +1028,21 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
                                  repetitions=BOOTSTRAP_REPETITIONS)})
     accuracy_deltas = [row["accuracy_delta"] for row in student_rows]
     tail_deltas = [row["tail_recall_delta"] for row in student_rows]
+    target_delta_summary = _mean_std(tail_deltas)
     aggregate = {"accuracy_delta": _mean_std(accuracy_deltas),
-                 "tail_recall_delta": _mean_std(tail_deltas)}
-    success = {"mean_tail_recall_at_least_1pp": aggregate["tail_recall_delta"]["mean"] >= 0.01,
+                 "target_recall_delta": target_delta_summary,
+                 "tail_recall_delta": target_delta_summary}
+    success = {"mean_target_recall_at_least_1pp": aggregate["target_recall_delta"]["mean"] >= 0.01,
+               "positive_target_seeds": sum(value > 0 for value in tail_deltas),
+               "mean_tail_recall_at_least_1pp": aggregate["tail_recall_delta"]["mean"] >= 0.01,
                "positive_tail_seeds": sum(value > 0 for value in tail_deltas),
                "mean_accuracy_guardrail": aggregate["accuracy_delta"]["mean"] >= -0.005}
-    success["passed"] = (success["mean_tail_recall_at_least_1pp"]
-                         and success["positive_tail_seeds"] >= 2
+    success["passed"] = (success["mean_target_recall_at_least_1pp"]
+                         and success["positive_target_seeds"] >= 2
                          and success["mean_accuracy_guardrail"])
     comparison = {"status": "complete", "protocol_sha256": protocol_sha256,
                   "study": spec.to_dict(), "evaluation_split": spec.evaluation_split,
+                  "target_classes": list(target_classes),
                   "teacher_selection": selection, "teacher": teacher_comparison,
                   "students": student_rows, "aggregate": aggregate, "success": success,
                   "evaluation_interpretation": (
@@ -964,7 +1053,7 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
     _freeze_text(directory / "report.md", _render_report(comparison))
     manifest_files = ["comparison.json", "report.md", "teacher_selection.json",
                       "teacher_repaired.pt", "teacher_repaired.json", "teacher_comparison.json",
-                      "candidate_results.json", "localization.json"]
+                      "candidate_results.json", "localization.json", "target_class_plan.json"]
     for seed in seeds:
         run = repaired_configs[seed].name
         manifest_files.extend([f"{run}/completion.json", f"{run}/student.pt"])

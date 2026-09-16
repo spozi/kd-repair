@@ -1,0 +1,13 @@
+{
+  "name": "cifar-cnn-f100-full",
+  "imbalance_factor": 100.0,
+  "teacher_run": "teacher_f100",
+  "student_run_template": "kd_f100_seed{seed}",
+  "teacher_seed": 41,
+  "student_seeds": [42, 43, 44],
+  "split_seed": 2026,
+  "training_epochs": 81,
+  "evaluation_split": "test",
+  "expected_train_counts": [4500, 2698, 1617, 969, 581, 348, 209, 125, 75, 45],
+  "expected_target_counts": [70, 42, 25, 15, 9]
+}

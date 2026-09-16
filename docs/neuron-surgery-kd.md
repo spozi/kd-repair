@@ -100,7 +100,7 @@ and [comparison data](../runs/cifar10-lt-neuron-surgery/comparison.json).
 
 ## Generalized protocol
 
-Version 2 accepts a frozen JSON `NeuronSurgerySpec` while retaining the original
+Version 4 accepts a frozen JSON `NeuronSurgerySpec` while retaining the original
 factor-100 defaults. The supported repair maps are:
 
 - `CifarCNN`: `stage2` and `stage3`, with the original convolution, BatchNorm,
@@ -119,3 +119,31 @@ Component ablations can set `kd_weight = 0`, `score_mode = "gradient_only"`, or
 `causal_validation = false`. Setting `downstream_kd = false` makes these
 validation-only teacher ablations, avoiding redundant 81-epoch student runs.
 See [the campaign protocol](neuron-surgery-campaign.md) for the fixed matrix.
+
+### Multi-dataset matrix
+
+The matrix protocol covers CIFAR-10, CIFAR-100, SVHN, CINIC-10, and GTSRB at
+balanced, IF10, IF50, and IF100 profiles. Catalog profile identity is part of
+the frozen baseline and study protocols. Balanced studies target every class;
+long-tailed studies deterministically target the lowest-frequency half of the
+classes, with class-index tie breaking. The resolved classes and training counts
+are written to `target_class_plan.json` before localization.
+
+Some IF100 classes can contain fewer than five usable training examples. Matrix
+studies therefore declare `allow_sparse_class_fallback = true`: companions first
+use correct non-target examples, then deterministic same-class examples with
+replacement, and use gradient-only attribution only for singleton classes.
+Unavailable classes are omitted from the causal preservation sample, and that
+coverage is recorded in `targets.json`. The fixed CIFAR-10 protocol keeps this
+fallback disabled.
+
+Generate the immutable 20-job plan and run it on four GPUs with:
+
+```bash
+python -m kd neuron-surgery-matrix-plan \
+  --output runs/experiment1-multidataset/matrix-plan
+scripts/run_gpu_experiment1_4gpu.sh --gpu-ids 0,1,2,3
+```
+
+The final `matrix_summary.json` and `matrix_summary.md` retain one row per
+dataset/profile. Predictions are never pooled across datasets.

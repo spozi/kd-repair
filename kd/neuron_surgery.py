@@ -108,8 +108,9 @@ def select_hard_tail_targets(records: list[dict], target_classes: Iterable[int] 
 
 
 def select_preservation_indices(records: list[dict], target_indices: Iterable[int], *,
-                                per_class_cap: int = 64, seed: int = 2026) -> list[int]:
-    """Choose an equal-size, correctly classified preservation set across all classes."""
+                                per_class_cap: int = 64, seed: int = 2026,
+                                allow_sparse_fallback: bool = False) -> list[int]:
+    """Choose an equal-size, correctly classified preservation set across usable classes."""
     if per_class_cap < 1:
         raise ValueError("per_class_cap must be positive")
     excluded = set(target_indices)
@@ -117,19 +118,24 @@ def select_preservation_indices(records: list[dict], target_indices: Iterable[in
     pools = {label: [int(row["index"]) for row in records
                      if row["true_label"] == label and row["correct"] and row["index"] not in excluded]
              for label in labels}
+    if allow_sparse_fallback:
+        pools = {label: pool for label, pool in pools.items() if pool}
+    if not pools:
+        raise ValueError("No correctly classified preservation samples are available")
     count = min(per_class_cap, *(len(pool) for pool in pools.values()))
     if count < 1:
         raise ValueError("Every class needs a correctly classified preservation sample")
     rng = np.random.default_rng(seed)
     chosen = []
-    for label in labels:
+    for label in sorted(pools):
         values = np.asarray(sorted(pools[label]), dtype=np.int64)
         chosen.extend(rng.permutation(values)[:count].tolist())
     return sorted(chosen)
 
 
 def build_companion_records(records: list[dict], embeddings: np.ndarray, targets: list[dict],
-                            *, companions: int = 5) -> list[dict]:
+                            *, companions: int = 5,
+                            allow_sparse_fallback: bool = False) -> list[dict]:
     """Find deterministic same-class correct nearest neighbours for each target."""
     embeddings = np.asarray(embeddings, dtype=np.float32)
     if embeddings.ndim != 2 or embeddings.shape[0] != len(records):
@@ -138,17 +144,34 @@ def build_companion_records(records: list[dict], embeddings: np.ndarray, targets
         raise ValueError("companions must be positive")
     target_indices = {int(row["index"]) for row in targets}
     by_label: dict[int, list[int]] = {}
+    all_by_label: dict[int, list[int]] = {}
     for row in records:
+        all_by_label.setdefault(int(row["true_label"]), []).append(int(row["index"]))
         if row["correct"] and row["index"] not in target_indices:
             by_label.setdefault(int(row["true_label"]), []).append(int(row["index"]))
     result = []
     for target in targets:
         index, label = int(target["index"]), int(target["true_label"])
-        candidates = np.asarray(sorted(by_label.get(label, [])), dtype=np.int64)
-        if len(candidates) < companions:
+        candidate_values = sorted(by_label.get(label, []))
+        policy = "correct_non_target"
+        gradient_only = False
+        if len(candidate_values) < companions and allow_sparse_fallback:
+            candidate_values = sorted(value for value in all_by_label.get(label, [])
+                                      if value != index)
+            policy = "same_class_fallback"
+        if not candidate_values and allow_sparse_fallback:
+            candidate_values = [index]
+            policy = "self_gradient_fallback"
+            gradient_only = True
+        candidates = np.asarray(candidate_values, dtype=np.int64)
+        if len(candidates) < companions and not allow_sparse_fallback:
             raise ValueError(f"Class {label} has fewer than {companions} eligible companions")
         similarities = embeddings[candidates] @ embeddings[index]
-        order = np.lexsort((candidates, -similarities))[:companions]
+        order = np.lexsort((candidates, -similarities))
+        if len(order) < companions:
+            order = np.resize(order, companions)
+        else:
+            order = order[:companions]
         neighbours = []
         for position in order:
             candidate_index = int(candidates[position])
@@ -157,8 +180,10 @@ def build_companion_records(records: list[dict], embeddings: np.ndarray, targets
                                "cosine_distance": float(1.0 - similarities[position]),
                                "true_label": int(source["true_label"]),
                                "predicted_label": int(source["predicted_label"]),
+                               "correct": bool(source["correct"]),
                                "confidence": float(source["confidence"])})
-        result.append({"target": dict(target), "companions": neighbours})
+        result.append({"target": dict(target), "companions": neighbours,
+                       "companion_policy": policy, "gradient_only": gradient_only})
     return result
 
 
@@ -177,7 +202,8 @@ class CompanionDataset(Dataset):
         target_index = int(record["target"]["index"])
         target_image, target_label = self.dataset[target_index]
         images = [self.dataset[int(row["index"])][0] for row in record["companions"]]
-        return target_image, int(target_label), target_index, torch.stack(images)
+        return (target_image, int(target_label), target_index, torch.stack(images),
+                bool(record.get("gradient_only", False)))
 
 
 def differential_channel_scores(model: VisionModel, dataset: Dataset,
@@ -199,7 +225,7 @@ def differential_channel_scores(model: VisionModel, dataset: Dataset,
     collected = {stage: [] for stage in stages}
     labels_seen, indices_seen = [], []
     try:
-        for target_images, labels, target_indices, companion_images in loader:
+        for target_images, labels, target_indices, companion_images, gradient_only in loader:
             target_images = move_images(target_images, device).requires_grad_(True)
             labels_device = move_labels(labels, device)
             target_output = model(target_images, return_features=True)
@@ -226,6 +252,7 @@ def differential_channel_scores(model: VisionModel, dataset: Dataset,
                         batch, count, *target_feature.shape[1:])
                     difference = (target_feature[:, None] - companion_feature).abs().mean((1, 3, 4))
                     score = difference * sensitivity
+                    score = torch.where(gradient_only.to(device)[:, None], sensitivity, score)
                 score = score / score.mean(1, keepdim=True).clamp_min(torch.finfo(score.dtype).eps)
                 if not torch.isfinite(score).all():
                     raise FloatingPointError("Non-finite differential channel score")

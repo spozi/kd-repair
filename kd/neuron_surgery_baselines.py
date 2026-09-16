@@ -10,7 +10,8 @@ from .checkpoints import fingerprint, write_json
 from .config import (BenchmarkConfig, DataConfig, DistillationConfig, ExperimentConfig,
                      ModelConfig, TrainConfig, from_dict)
 from .engine import run_experiment
-from .neuron_surgery_study import NeuronSurgerySpec, _data_available
+from .neuron_surgery_study import (NeuronSurgerySpec, _data_available,
+                                   resolved_dataset_profile)
 from .runtime import accelerator_workers
 
 
@@ -22,14 +23,15 @@ def baseline_configs(output: str | Path, root: str | Path, device: str,
     """Build the teacher and seed-matched classical-KD controls for a study spec."""
     spec.validate()
     output = str(Path(output).resolve())
+    profile = resolved_dataset_profile(spec)
     data = DataConfig(
         source=spec.dataset_source, root=str(Path(root).resolve()),
         num_classes=spec.dataset_num_classes, image_size=spec.dataset_image_size,
-        dataset_version=spec.dataset_version,
+        dataset_version=spec.dataset_version, dataset_profile=profile,
         horizontal_flip=spec.dataset_source in {"cifar10", "cifar100", "cinic10"},
         validation_fraction=0.1,
         confirmation_fraction=spec.confirmation_fraction, split_seed=spec.split_seed,
-        imbalance_factor=spec.imbalance_factor)
+        imbalance_factor=spec.imbalance_factor if profile == "balanced" else 1.0)
     workers = accelerator_workers(device, 0)
     train = TrainConfig(
         epochs=spec.training_epochs, batch_size=128, learning_rate=0.05, momentum=0.9,

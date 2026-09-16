@@ -115,6 +115,19 @@ def main(argv=None) -> None:
     neuron_campaign.add_argument("--device", type=device_spec,
                                  default="auto")
     neuron_campaign.add_argument("--dry-run", action="store_true")
+    matrix_plan = subparsers.add_parser(
+        "neuron-surgery-matrix-plan",
+        help="Materialize the frozen multi-dataset Experiment 1 job matrix")
+    matrix_plan.add_argument("--output", required=True)
+    matrix_plan.add_argument("--datasets", nargs="+",
+                             choices=["cifar10", "cifar100", "svhn", "cinic10", "gtsrb"])
+    matrix_plan.add_argument("--profiles", nargs="+",
+                             choices=["balanced", "lt-if10", "lt-if50", "lt-if100"])
+    matrix_summary = subparsers.add_parser(
+        "neuron-surgery-matrix-summary",
+        help="Aggregate completed matrix studies without pooling dataset samples")
+    matrix_summary.add_argument("--plan", required=True)
+    matrix_summary.add_argument("--output-root", required=True)
     student_surgery = subparsers.add_parser(
         "student-surgery-study",
         help="Compare supervised student surgery against matched supervised and KD arms")
@@ -209,6 +222,13 @@ def main(argv=None) -> None:
             report = run_neuron_surgery_campaign(
                 args.output, data_root=args.root, legacy_baseline=args.baseline,
                 reference_study=args.reference, device=args.device, dry_run=args.dry_run)
+        elif args.command == "neuron-surgery-matrix-plan":
+            from .neuron_surgery_matrix import materialize_matrix_plan
+            report = materialize_matrix_plan(
+                args.output, datasets=args.datasets, profiles=args.profiles)
+        elif args.command == "neuron-surgery-matrix-summary":
+            from .neuron_surgery_matrix import summarize_matrix
+            report = summarize_matrix(args.plan, args.output_root)
         elif args.command == "cpc-study":
             from .cpc_study import run_cpc_study
             report = run_cpc_study(args.baseline,args.output,args.device,dry_run=args.dry_run)
