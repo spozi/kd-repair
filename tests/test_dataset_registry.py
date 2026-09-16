@@ -17,10 +17,11 @@ from torch.utils.data import Dataset
 
 from kd.config import DataConfig, ExperimentConfig, TrainConfig
 from kd.data import build_data
-from kd.dataset_registry import (CatalogError, configure_registry, create_mirror_manifest,
-                                 fetch_dataset, initialize_registry, load_catalog,
-                                 registry_status, sha256_value, validate_registry,
-                                 verify_dataset)
+from kd.dataset_registry import (CatalogError, _loader_smoke_check,
+                                 _materialize_dataset_layout, configure_registry,
+                                 create_mirror_manifest, fetch_dataset, initialize_registry,
+                                 load_catalog, registry_status, sha256_value,
+                                 validate_registry, verify_dataset)
 
 
 # Dataset preparation reports progress on stderr; unittest discovery may import this
@@ -169,6 +170,86 @@ class DatasetRegistryTests(unittest.TestCase):
             with patch("kd.dataset_registry.CATALOG_PATH", catalog_path):
                 fetch_dataset("toy", root=root / "data")
             self.assertEqual((root / "data/toy/1/objects/sample.txt").read_text(), "sample")
+
+    def test_torchvision_layout_materialization_is_idempotent_and_loadable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            eurosat = root / "eurosat"
+            for label in range(10):
+                path = eurosat / "eurosat" / "EuroSAT_RGB" / f"class_{label}" / "one.jpg"
+                path.parent.mkdir(parents=True)
+                Image.new("RGB", (8, 8), color=(label, 0, 0)).save(path)
+            expected = {"eurosat/2750": "EuroSAT_RGB"}
+            self.assertEqual(_materialize_dataset_layout("eurosat", eurosat), expected)
+            self.assertEqual(_materialize_dataset_layout("eurosat", eurosat), expected)
+            self.assertEqual(os.readlink(eurosat / "eurosat/2750"), "EuroSAT_RGB")
+            self.assertEqual(_loader_smoke_check("eurosat", eurosat, 10)["class_count"], 10)
+
+            caltech = root / "caltech101"
+            categories = ["BACKGROUND_Google", *(f"class_{label:03d}" for label in range(101))]
+            for label, category in enumerate(categories):
+                path = caltech / "101_ObjectCategories" / category / "image_0001.jpg"
+                path.parent.mkdir(parents=True)
+                Image.new("RGB", (8, 8), color=(label % 255, 0, 0)).save(path)
+            expected = {"caltech101/101_ObjectCategories": "../101_ObjectCategories"}
+            self.assertEqual(_materialize_dataset_layout("caltech101", caltech), expected)
+            self.assertEqual(_materialize_dataset_layout("caltech101", caltech), expected)
+            self.assertEqual(os.readlink(caltech / "caltech101/101_ObjectCategories"),
+                             "../101_ObjectCategories")
+            self.assertEqual(
+                _loader_smoke_check("caltech101", caltech, 101)["class_count"], 101)
+
+    def test_eurosat_fetch_materializes_and_verifies_torchvision_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            for label in range(10):
+                path = source / "EuroSAT_RGB" / f"class_{label}" / "one.jpg"
+                path.parent.mkdir(parents=True)
+                Image.new("RGB", (8, 8), color=(label, 0, 0)).save(path)
+            archive = root / "eurosat.zip"
+            with zipfile.ZipFile(archive, "w") as handle:
+                for path in source.rglob("*.jpg"):
+                    handle.write(path, path.relative_to(source))
+            catalog = _catalog(archive.read_bytes(), archive.as_uri())
+            recipe = catalog["datasets"].pop("toy")
+            recipe.update(classes=10, artifacts=[{
+                **recipe["artifacts"][0], "filename": "eurosat.zip",
+                "extract_to": "eurosat",
+            }])
+            catalog["datasets"]["eurosat"] = recipe
+            catalog["storage_limit_bytes"] = archive.stat().st_size + 1
+            catalog_path = root / "catalog.json"
+            catalog_path.write_text(json.dumps(catalog))
+            data_root = root / "data"
+            with patch("kd.dataset_registry.CATALOG_PATH", catalog_path), \
+                    patch("kd.dataset_registry._mirror_files", return_value={}):
+                fetched = fetch_dataset("eurosat", root=data_root)
+                verified = verify_dataset("eurosat", root=data_root)
+            target = data_root / "eurosat/1"
+            self.assertEqual(fetched["materialized_layout"],
+                             {"eurosat/2750": "EuroSAT_RGB"})
+            self.assertEqual(fetched["loader_smoke"]["class_count"], 10)
+            self.assertEqual(verified["loader_smoke"]["class_count"], 10)
+            self.assertEqual(os.readlink(target / "eurosat/2750"), "EuroSAT_RGB")
+
+    def test_layout_materialization_rejects_conflicting_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "eurosat/EuroSAT_RGB"
+            source.mkdir(parents=True)
+            conflict = root / "eurosat/2750"
+            conflict.mkdir()
+            with self.assertRaisesRegex(CatalogError, "Refusing to replace"):
+                _materialize_dataset_layout("eurosat", root)
+
+            caltech = root / "caltech"
+            (caltech / "101_ObjectCategories").mkdir(parents=True)
+            link = caltech / "caltech101/101_ObjectCategories"
+            link.parent.mkdir()
+            link.symlink_to("../wrong-directory", target_is_directory=True)
+            with self.assertRaisesRegex(CatalogError, "unexpected target"):
+                _materialize_dataset_layout("caltech101", caltech)
 
 
 class FakeSVHN(Dataset):
