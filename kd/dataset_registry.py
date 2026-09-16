@@ -363,6 +363,65 @@ def _safe_extract(archive: Path, destination: Path) -> None:
         raise CatalogError(f"Unsupported archive format: {archive}")
 
 
+_LAYOUT_LINKS = {
+    "eurosat": (Path("eurosat/2750"), Path("EuroSAT_RGB")),
+    "caltech101": (Path("caltech101/101_ObjectCategories"),
+                   Path("../101_ObjectCategories")),
+}
+
+
+def _materialize_dataset_layout(name: str, target: Path) -> dict:
+    """Bridge canonical archive layouts to paths expected by torchvision."""
+    layout = _LAYOUT_LINKS.get(name)
+    if layout is None:
+        return {}
+    link, relative_target = target / layout[0], layout[1]
+    link.parent.mkdir(parents=True, exist_ok=True)
+    source = link.parent / relative_target
+    if not source.is_dir():
+        raise CatalogError(f"Extracted {name} dataset directory is missing: {source}")
+    if link.is_symlink():
+        if Path(os.readlink(link)) != relative_target:
+            raise CatalogError(
+                f"Dataset layout symlink has unexpected target: {link} -> {os.readlink(link)}")
+    elif link.exists():
+        raise CatalogError(f"Refusing to replace existing dataset layout path: {link}")
+    else:
+        link.symlink_to(relative_target, target_is_directory=True)
+    return {str(layout[0]): str(relative_target)}
+
+
+def _loader_smoke_check(name: str, target: Path, expected_classes: int) -> dict:
+    """Ensure prepared layouts are discoverable through their production loader."""
+    if name not in _LAYOUT_LINKS:
+        return {}
+    from torchvision import datasets
+
+    try:
+        dataset = (datasets.EuroSAT(target, download=False) if name == "eurosat"
+                   else datasets.Caltech101(target, download=False))
+        classes = dataset.classes if name == "eurosat" else dataset.categories
+        if len(classes) != expected_classes:
+            raise CatalogError(
+                f"Prepared {name} has {len(classes)} classes; expected {expected_classes}")
+        if not dataset:
+            raise CatalogError(f"Prepared {name} contains no samples")
+        image, label = dataset[0]
+        try:
+            if image is None or not 0 <= int(label) < expected_classes:
+                raise CatalogError(f"Prepared {name} returned an invalid first sample")
+        finally:
+            close = getattr(image, "close", None)
+            if close is not None:
+                close()
+    except CatalogError:
+        raise
+    except Exception as error:
+        raise CatalogError(f"Prepared {name} cannot be loaded: {error}") from error
+    return {"class_count": len(classes), "sample_count": len(dataset),
+            "first_label": int(label)}
+
+
 def fetch_dataset(name: str, version: str | None = None, profile: str = "balanced",
                   root: str | Path = "data") -> dict:
     if profile not in PROFILES:
@@ -408,11 +467,16 @@ def fetch_dataset(name: str, version: str | None = None, profile: str = "balance
         artifacts.append({"id": artifact["id"], "filename": artifact["filename"],
                           "size": destination.stat().st_size,
                           "sha256": file_hash(destination), "source": source})
+    layout = _materialize_dataset_layout(name, target)
+    loader_smoke = _loader_smoke_check(name, target, recipe["classes"])
     marker = {"schema_version": 1, "catalog_version": catalog["catalog_version"],
               "catalog_sha256": sha256_value(catalog), "recipe_sha256": sha256_value(recipe),
               "dataset": name, "version": recipe["version"], "requested_profile": profile,
               "profiles": list(PROFILES),
               "split_seed": catalog["split_seed"], "artifacts": artifacts}
+    if layout:
+        marker["materialized_layout"] = layout
+        marker["loader_smoke"] = loader_smoke
     if mirror_error:
         marker["mirror_fallback"] = "Private registry unavailable; fetched from canonical upstream"
     (target / MARKER).write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
@@ -445,7 +509,9 @@ def verify_dataset(name: str, version: str | None = None, profile: str = "balanc
         total += path.stat().st_size
     if total > catalog["storage_limit_bytes"]:
         raise CatalogError("Dataset exceeds the catalog storage limit")
-    return {**marker, "profile": profile, "verified": True, "total_bytes": total}
+    loader_smoke = _loader_smoke_check(name, target, recipe["classes"])
+    return {**marker, "profile": profile, "verified": True, "total_bytes": total,
+            **({"loader_smoke": loader_smoke} if loader_smoke else {})}
 
 
 def list_datasets() -> dict:
