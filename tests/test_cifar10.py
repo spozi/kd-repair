@@ -229,9 +229,11 @@ class LongTailedSamplingTests(unittest.TestCase):
         for bad in (0.5, -1.0, float("nan"), float("inf")):
             with self.assertRaises(ValueError):
                 long_tailed_subset(self.targets, self.indices, bad, 2026)
-        # A factor that would empty a class must fail loudly rather than silently.
-        with self.assertRaises(ValueError):
-            long_tailed_subset(self.targets, self.indices, 1e6, 2026)
+        # Small splits retain one deterministic example per class instead of
+        # making high-imbalance catalog profiles impossible to construct.
+        extreme = long_tailed_subset(self.targets, self.indices, 1e6, 2026)
+        extreme_counts = np.bincount(np.asarray(self.targets)[extreme], minlength=4)
+        self.assertTrue((extreme_counts >= 1).all())
         for bad in (0.5, float("nan"), True):
             with self.assertRaises(ValueError):
                 ExperimentConfig(data=DataConfig(source="cifar10", num_classes=10, image_size=32,
