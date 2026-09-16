@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
+import time
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 import zipfile
@@ -29,6 +32,67 @@ class CatalogError(ValueError):
 
 class RegistryUnavailable(RuntimeError):
     pass
+
+
+def _progress_enabled() -> bool:
+    return os.environ.get("KD_PROGRESS", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _status(message: str) -> None:
+    """Report preparation progress on stderr; stdout stays reserved for the JSON report."""
+    if _progress_enabled():
+        print(message, file=sys.stderr, flush=True)
+
+
+def _human_bytes(count: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if count < 1024:
+            return f"{count:.0f} {unit}" if unit == "B" else f"{count:.1f} {unit}"
+        count /= 1024
+    return f"{count:.1f} TiB"
+
+
+def _progress_interval() -> float:
+    """Redraw often on a terminal; keep piped supervisor logs readable."""
+    return 0.5 if sys.stderr.isatty() else 5.0
+
+
+def _report_transfer(label: str, copied: int, total: int, elapsed: float, *,
+                     final: bool = False) -> None:
+    if not _progress_enabled():
+        return
+    rate = copied / elapsed if elapsed > 0 else 0.0
+    parts = [_human_bytes(copied)]
+    if total:
+        parts.append(f"of {_human_bytes(total)} ({100 * copied / total:5.1f}%)")
+    parts.append(f"at {_human_bytes(rate)}/s")
+    if total and rate > 0 and not final:
+        remaining = max(total - copied, 0) / rate
+        parts.append(f"eta {int(remaining // 60)}m{int(remaining % 60):02d}s")
+    line = f"    {label}: {' '.join(parts)}"
+    if sys.stderr.isatty():
+        print(f"\r\x1b[K{line}", end="\n" if final else "", file=sys.stderr, flush=True)
+    else:
+        print(line, file=sys.stderr, flush=True)
+
+
+def _copy_with_progress(response, handle, label: str, total: int) -> int:
+    copied = 0
+    started = time.monotonic()
+    last_report = started
+    interval = _progress_interval()
+    while True:
+        block = response.read(256 * 1024)
+        if not block:
+            break
+        handle.write(block)
+        copied += len(block)
+        now = time.monotonic()
+        if now - last_report >= interval:
+            last_report = now
+            _report_transfer(label, copied, total, now - started)
+    _report_transfer(label, copied, total, time.monotonic() - started, final=True)
+    return copied
 
 
 def registry_config_path(path: str | Path | None = None) -> Path:
@@ -162,10 +226,43 @@ def dataset_directory(root: str | Path, name: str, version: str) -> Path:
     return Path(root) / name / version
 
 
-def _run(command: list[str], *, cwd: Path | None = None, env: dict | None = None) -> None:
-    result = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True)
-    if result.returncode:
-        detail = result.stderr.strip() or result.stdout.strip()
+def _run(command: list[str], *, cwd: Path | None = None, env: dict | None = None,
+         label: str | None = None) -> None:
+    """Run a registry command, streaming its output so long clones and LFS pulls stay visible."""
+    if label:
+        _status(f"  {label}")
+    process = subprocess.Popen(command, cwd=cwd, env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    tail: deque[str] = deque(maxlen=20)
+    pending = ""
+    last_report = 0.0
+    interval = _progress_interval()
+
+    def emit(segment: str) -> None:
+        nonlocal last_report
+        if not segment.strip():
+            return
+        tail.append(segment)
+        now = time.monotonic()
+        # Percentage counters repeat constantly; throttle them but never hide plain messages.
+        if "%" in segment and now - last_report < interval:
+            return
+        last_report = now
+        _status(f"    {segment.strip()}")
+
+    with process:
+        while True:
+            chunk = process.stdout.read1(4096)
+            if not chunk:
+                break
+            pending += chunk.decode("utf-8", "replace")
+            segments = re.split(r"[\r\n]", pending)
+            pending = segments.pop()
+            for segment in segments:
+                emit(segment)
+        emit(pending)
+    if process.returncode:
+        detail = "\n".join(tail).strip() or f"exit status {process.returncode}"
         raise RegistryUnavailable(f"Dataset registry command failed: {detail}")
 
 
@@ -176,13 +273,16 @@ def _registry_checkout(root: Path, registry: str, ref: str) -> Path:
     if not re.fullmatch(r"catalog-v\d+\.\d+\.\d+", ref):
         raise RegistryUnavailable("Private registry ref must be an immutable catalog tag")
     checkout = root / ".registry" / "kd-repair"
-    environment = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+    environment = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1", "GIT_LFS_FORCE_PROGRESS": "1"}
     if not checkout.exists():
         checkout.parent.mkdir(parents=True, exist_ok=True)
-        _run(["git", "clone", "--filter=blob:none", "--no-checkout", registry, str(checkout)],
-             env=environment)
-    _run(["git", "fetch", "--tags", "origin"], cwd=checkout, env=environment)
-    _run(["git", "checkout", "--detach", ref], cwd=checkout, env=environment)
+        _run(["git", "clone", "--progress", "--filter=blob:none", "--no-checkout",
+              registry, str(checkout)], env=environment,
+             label=f"cloning dataset registry into {checkout}")
+    _run(["git", "fetch", "--progress", "--tags", "origin"], cwd=checkout, env=environment,
+         label="fetching registry tags")
+    _run(["git", "checkout", "--detach", ref], cwd=checkout, env=environment,
+         label=f"checking out catalog {ref}")
     return checkout
 
 
@@ -207,7 +307,9 @@ def _mirror_files(root: Path, name: str, recipe: dict) -> dict[str, Path]:
             raise RegistryUnavailable(f"Invalid private mirror path for {artifact['id']}")
         paths.append(relative)
     if (checkout / ".git").exists():
-        _run(["git", "lfs", "pull", "--include", ",".join(paths), "--exclude", ""], cwd=checkout)
+        _run(["git", "lfs", "pull", "--include", ",".join(paths), "--exclude", ""], cwd=checkout,
+             env={**os.environ, "GIT_LFS_FORCE_PROGRESS": "1"},
+             label=f"pulling {len(paths)} mirrored archive(s) for {name}")
     result = {}
     for artifact, relative in zip(recipe["artifacts"], paths):
         path = checkout / relative
@@ -227,7 +329,8 @@ def _download(url: str, destination: Path) -> None:
         temporary_path = Path(temporary.name)
         try:
             with urlopen(request) as response:
-                shutil.copyfileobj(response, temporary)
+                total = int(response.headers.get("Content-Length") or 0)
+                _copy_with_progress(response, temporary, destination.name, total)
             os.replace(temporary_path, destination)
         except Exception:
             temporary_path.unlink(missing_ok=True)
@@ -267,22 +370,32 @@ def fetch_dataset(name: str, version: str | None = None, profile: str = "balance
         mirror = _mirror_files(Path(root), name, recipe)
     except RegistryUnavailable as error:
         mirror_error = str(error)
+    _status(f"[fetch] {name} {recipe['version']} (profile {profile}) -> {target}")
+    if mirror_error:
+        _status(f"  private registry unavailable ({mirror_error}); using canonical upstream")
     artifacts = []
-    for artifact in recipe["artifacts"]:
+    total_artifacts = len(recipe["artifacts"])
+    for position, artifact in enumerate(recipe["artifacts"], start=1):
         destination = target / artifact["filename"]
+        prefix = f"  [{position}/{total_artifacts}] {artifact['filename']}"
         if not destination.is_file() or file_hash(destination, "md5") != artifact["md5"]:
             if artifact["id"] in mirror:
+                _status(f"{prefix}: copying from the private registry")
                 shutil.copy2(mirror[artifact["id"]], destination)
                 source = "private_registry"
             else:
+                _status(f"{prefix}: downloading from {urlsplit(artifact['url']).netloc}")
                 _download(artifact["url"], destination)
                 source = "upstream"
         else:
+            _status(f"{prefix}: already present")
             source = "local"
+        _status(f"{prefix}: verifying checksum")
         if file_hash(destination, "md5") != artifact["md5"]:
             destination.unlink(missing_ok=True)
             raise CatalogError(f"Checksum mismatch for {name}/{artifact['id']}")
         if artifact.get("extract_to") is not None:
+            _status(f"{prefix}: extracting")
             extracted_root = target / artifact["extract_to"]
             _safe_extract(destination, extracted_root)
             for nested in artifact.get("nested_extract", []):
@@ -298,6 +411,7 @@ def fetch_dataset(name: str, version: str | None = None, profile: str = "balance
     if mirror_error:
         marker["mirror_fallback"] = "Private registry unavailable; fetched from canonical upstream"
     (target / MARKER).write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    _status(f"[fetch] {name} ready ({_human_bytes(sum(r['size'] for r in artifacts))})")
     return marker
 
 
@@ -317,6 +431,7 @@ def verify_dataset(name: str, version: str | None = None, profile: str = "balanc
         raise CatalogError(f"Prepared dataset does not support profile {profile}")
     recorded = {record["id"]: record for record in marker.get("artifacts", [])}
     total = 0
+    _status(f"[verify] {name} {recipe['version']} (profile {profile})")
     for artifact in recipe["artifacts"]:
         path = target / artifact["filename"]
         record = recorded.get(artifact["id"], {})

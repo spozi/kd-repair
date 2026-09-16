@@ -79,6 +79,9 @@ fi
 
 cd "$REPO_ROOT"
 
+# Keep child output flowing through the tee pipe below instead of being block-buffered.
+export PYTHONUNBUFFERED=1
+
 if [[ ! -f "$STUDY_CONFIG" ]]; then
   printf 'Study configuration not found: %s\n' "$STUDY_CONFIG" >&2
   exit 1

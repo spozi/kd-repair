@@ -23,6 +23,11 @@ from kd.dataset_registry import (CatalogError, configure_registry, create_mirror
                                  verify_dataset)
 
 
+# Dataset preparation reports progress on stderr; unittest discovery may import this
+# module outside the package, so silence it here as well as in tests/__init__.py.
+os.environ.setdefault("KD_PROGRESS", "0")
+
+
 def _digest(data: bytes, algorithm: str) -> str:
     return hashlib.new(algorithm, data).hexdigest()
 

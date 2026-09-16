@@ -75,6 +75,15 @@ keeps four isolated workers active, starts the next study when a GPU becomes fre
 dataset/profile report under `runs/experiment1-multidataset/`. Use `--datasets` or `--profiles` for a
 smaller matrix. Every job can resume independently.
 
+The launcher provisions Python itself: an activated virtualenv is reused as-is, otherwise it creates
+the `kd` Conda environment (or a local `.venv` when Conda is absent) and installs the CUDA PyTorch
+build plus this project. Installs are skipped when the dependencies already import; `--force-bootstrap`
+reinstalls them. Long operations are no longer silent — dataset downloads and Git LFS transfers report
+transferred bytes, rate, and ETA, pip shows download progress, and the queue prints a status table
+every `--status-interval` seconds listing each GPU's job, elapsed time, and latest log line. Use
+`--stream-logs` to mirror worker output into the console, and `--fetch-all-datasets` to prepare the
+whole catalog instead of only the datasets in the matrix.
+
 Use an indexed device directly:
 
 ```bash
