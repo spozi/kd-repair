@@ -17,6 +17,10 @@ DATA_ROOT="${DATA_ROOT:-data}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-runs/experiment1-multidataset}"
 REGISTRY_URL="${KD_DATASET_REGISTRY:-https://gitea.izzus.dev/syafiq/kd-repair.git}"
 REGISTRY_REF="${KD_DATASET_REGISTRY_REF:-catalog-v1.2.0}"
+GPU_IDS_SET=0
+if [[ -n "${GPU_IDS+x}" ]]; then
+  GPU_IDS_SET=1
+fi
 GPU_IDS_CSV="${GPU_IDS:-0,1,2,3}"
 DATASETS_CSV="${EXPERIMENT_DATASETS:-cinic10,svhn,cifar100,cifar10,gtsrb}"
 PROFILES_CSV="${EXPERIMENT_PROFILES:-balanced,lt-if10,lt-if50,lt-if100}"
@@ -42,12 +46,12 @@ CATALOG_DATASETS=(
 
 usage() {
   cat <<'EOF'
-Run the multi-dataset Experiment 1 matrix on four CUDA GPUs.
+Run the multi-dataset Experiment 1 matrix across one or more CUDA GPUs.
 
 Usage: scripts/run_gpu_experiment1_4gpu.sh [options]
 
 Options:
-  --gpu-ids IDS         Four comma-separated physical GPU IDs (default: 0,1,2,3)
+  --gpu-ids IDS         Comma-separated physical GPU IDs (default: every detected GPU)
   --datasets NAMES      Comma-separated dataset subset
   --profiles NAMES      Comma-separated profile subset
   --python PATH         Python interpreter; skips automatic provisioning
@@ -74,14 +78,15 @@ Conda environment is created when Conda is available, and otherwise a local
 to reinstall.
 
 Default matrix: CIFAR-10, CIFAR-100, SVHN, CINIC-10, and GTSRB, each with
-balanced, IF10, IF50, and IF100 profiles (20 studies). The queue keeps four
-workers active and resumes validated artifacts when rerun with the same output.
+balanced, IF10, IF50, and IF100 profiles (20 studies). The queue keeps one
+worker busy per GPU and resumes validated artifacts when rerun with the same
+output.
 EOF
 }
 
 while (($#)); do
   case "$1" in
-    --gpu-ids) GPU_IDS_CSV="$2"; shift 2 ;;
+    --gpu-ids) GPU_IDS_CSV="$2"; GPU_IDS_SET=1; shift 2 ;;
     --datasets) DATASETS_CSV="$2"; shift 2 ;;
     --profiles) PROFILES_CSV="$2"; shift 2 ;;
     --python) PYTHON_BIN="$2"; PYTHON_BIN_SET=1; shift 2 ;;
@@ -110,11 +115,20 @@ if ((BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1))); 
   exit 1
 fi
 
+# Without an explicit selection, use every GPU the driver reports rather than a fixed guess.
+if ((GPU_IDS_SET == 0)) && command -v nvidia-smi >/dev/null 2>&1; then
+  DETECTED_GPU_IDS="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null \
+    | tr -d '[:blank:]' | tr '\n' ',' | sed 's/,*$//')"
+  if [[ -n "$DETECTED_GPU_IDS" ]]; then
+    GPU_IDS_CSV="$DETECTED_GPU_IDS"
+  fi
+fi
+
 IFS=',' read -r -a GPU_IDS_ARRAY <<< "$GPU_IDS_CSV"
 IFS=',' read -r -a DATASETS_ARRAY <<< "$DATASETS_CSV"
 IFS=',' read -r -a PROFILES_ARRAY <<< "$PROFILES_CSV"
-if ((${#GPU_IDS_ARRAY[@]} != 4)); then
-  printf 'Exactly four GPU IDs are required; received: %s\n' "$GPU_IDS_CSV" >&2
+if ((${#GPU_IDS_ARRAY[@]} < 1)); then
+  printf 'At least one GPU ID is required; received: %s\n' "$GPU_IDS_CSV" >&2
   exit 2
 fi
 if ((${#DATASETS_ARRAY[@]} == 0 || ${#PROFILES_ARRAY[@]} == 0)); then

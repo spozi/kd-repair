@@ -184,7 +184,7 @@ python -m kd neuron-surgery-campaign \
 Individual generalized studies use `--study-config configs/neuron_surgery/NAME.json`. Missing matched controls can be generated with `python -m kd neuron-surgery-baselines --study-config ...`.
 
 To run Experiment 1 across CIFAR-10, CIFAR-100, SVHN, CINIC-10, and GTSRB at
-balanced, IF10, IF50, and IF100 profiles on four GPUs:
+balanced, IF10, IF50, and IF100 profiles across every detected GPU:
 
 ```bash
 scripts/run_gpu_experiment1_4gpu.sh --gpu-ids 0,1,2,3
