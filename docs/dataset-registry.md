@@ -1,27 +1,28 @@
 # Private dataset registry
 
 The source repository is public and contains only recipes, checksums, split rules, and code. Raw
-archives may be cached in a separate private Gitea repository through Git LFS. Training remains
-usable without Gitea by falling back to the canonical upstream source.
+archives are cached in a companion Gitea repository through Git LFS. Training remains usable
+without Gitea by falling back to the canonical upstream source.
 
-## Security boundary
+## Access boundary
 
-Make `syafiq/kd-repair` private before its first push. Confirm that an unauthenticated API request
-and clone cannot discover the repository. Never put a Gitea token, private SSH key, or authenticated
+The mirror at `syafiq/kd-repair` is public: read access needs no credentials, and anonymous HTTPS
+clones and Git LFS transfers both work. Never put a Gitea token, private SSH key, or authenticated
 URL in this repository, an experiment config, or a run artifact.
 
-Local access uses the SSH URL:
+Read access uses the HTTPS URL, which is the default for every fetch:
 
 ```text
-ssh://git@gitea.izzus.dev:2222/syafiq/kd-repair.git
+https://gitea.izzus.dev/syafiq/kd-repair.git
 ```
 
-Trusted automation should use separate read-only and publication tokens held by the Gitea secret
-store. Public GitHub workflows must not receive either token.
+Publishing new archives still requires an authenticated SSH remote. Trusted automation should use a
+publication token held by the Gitea secret store. Public GitHub workflows must not receive it.
 
-## Bootstrap the private repository
+## Bootstrap and publish to the registry
 
-Start from an empty directory after the remote has been made private:
+Publication is the one operation that still needs credentials. Start from an empty directory, using
+an SSH remote that is allowed to push:
 
 ```bash
 python -m kd dataset registry-init /path/to/kd-repair-data
@@ -52,7 +53,7 @@ credential:
 
 ```bash
 python -m kd dataset registry-config \
-  --url ssh://git@gitea.izzus.dev:2222/syafiq/kd-repair.git \
+  --url https://gitea.izzus.dev/syafiq/kd-repair.git \
   --ref catalog-v1.2.0
 python -m kd dataset registry-status
 ```

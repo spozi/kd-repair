@@ -273,7 +273,11 @@ def _registry_checkout(root: Path, registry: str, ref: str) -> Path:
     if not re.fullmatch(r"catalog-v\d+\.\d+\.\d+", ref):
         raise RegistryUnavailable("Private registry ref must be an immutable catalog tag")
     checkout = root / ".registry" / "kd-repair"
-    environment = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1", "GIT_LFS_FORCE_PROGRESS": "1"}
+    # Never block an unattended run on a credential or host-key prompt; failing fast
+    # lets fetch_dataset fall back to the canonical upstream sources instead.
+    environment = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1", "GIT_LFS_FORCE_PROGRESS": "1",
+                   "GIT_TERMINAL_PROMPT": "0",
+                   "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")}
     if not checkout.exists():
         checkout.parent.mkdir(parents=True, exist_ok=True)
         _run(["git", "clone", "--progress", "--filter=blob:none", "--no-checkout",
@@ -308,7 +312,8 @@ def _mirror_files(root: Path, name: str, recipe: dict) -> dict[str, Path]:
         paths.append(relative)
     if (checkout / ".git").exists():
         _run(["git", "lfs", "pull", "--include", ",".join(paths), "--exclude", ""], cwd=checkout,
-             env={**os.environ, "GIT_LFS_FORCE_PROGRESS": "1"},
+             env={**os.environ, "GIT_LFS_FORCE_PROGRESS": "1", "GIT_TERMINAL_PROMPT": "0",
+                  "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")},
              label=f"pulling {len(paths)} mirrored archive(s) for {name}")
     result = {}
     for artifact, relative in zip(recipe["artifacts"], paths):
