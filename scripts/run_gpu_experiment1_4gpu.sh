@@ -12,7 +12,7 @@ fi
 PYTHON_BIN="${PYTHON_BIN:-python}"
 CONDA_ENV="${CONDA_ENV:-kd}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
-PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
+PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu132}"
 DATA_ROOT="${DATA_ROOT:-data}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-runs/experiment1-multidataset}"
 REGISTRY_URL="${KD_DATASET_REGISTRY:-https://gitea.izzus.dev/syafiq/kd-repair.git}"
@@ -52,7 +52,7 @@ Options:
   --profiles NAMES      Comma-separated profile subset
   --python PATH         Python interpreter; skips automatic provisioning
   --conda-env NAME      Conda environment to provision when no venv is active (default: kd)
-  --pytorch-index URL   PyTorch CUDA wheel index (default: cu121)
+  --pytorch-index URL   PyTorch CUDA wheel index (default: cu132)
   --skip-bootstrap      Use the current/default Python without provisioning anything
   --force-bootstrap     Reinstall dependencies even when they are already importable
   --data-root PATH      Dataset directory (default: data)
@@ -165,8 +165,41 @@ pip_progress_flag() {
   if [[ -t 1 ]]; then printf '%s' 'on'; else printf '%s' 'raw'; fi
 }
 
-python_has_requirements() {
+torch_supports_local_gpu() {
+  # A wheel built for the wrong architecture imports cleanly and only fails at the first
+  # kernel launch, so compare each GPU's compute capability against the wheel's arch list.
   "$1" - <<'PY' >/dev/null 2>&1
+import sys
+
+try:
+    import torch
+except Exception:
+    raise SystemExit(1)
+if not torch.cuda.is_available():
+    raise SystemExit(0)
+architectures = torch.cuda.get_arch_list()
+for index in range(torch.cuda.device_count()):
+    major, minor = torch.cuda.get_device_capability(index)
+    if f"sm_{major}{minor}" not in architectures:
+        raise SystemExit(1)
+PY
+}
+
+report_gpu_mismatch() {
+  "$1" - 2>/dev/null <<'PY' || true
+import torch
+
+names = sorted({torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())})
+caps = sorted({"sm_%d%d" % torch.cuda.get_device_capability(i)
+               for i in range(torch.cuda.device_count())})
+print(f"  installed torch {torch.__version__} has kernels for: "
+      f"{' '.join(torch.cuda.get_arch_list())}")
+print(f"  this machine has: {', '.join(names)} ({', '.join(caps)})")
+PY
+}
+
+python_has_requirements() {
+  "$1" - <<'PY' >/dev/null 2>&1 || return 1
 import importlib.util
 import sys
 
@@ -176,6 +209,8 @@ for module in ("torch", "torchvision", "numpy", "PIL", "scipy", "matplotlib"):
     if importlib.util.find_spec(module) is None:
         raise SystemExit(1)
 PY
+  # Being importable is not enough: the wheel must carry kernels for this machine's GPUs.
+  torch_supports_local_gpu "$1"
 }
 
 ensure_requirements() {
@@ -187,10 +222,15 @@ ensure_requirements() {
   progress="$(pip_progress_flag)"
   log_stage "Installing dependencies into ${interpreter}"
   "$interpreter" -m pip install --upgrade pip
-  if ((FORCE_BOOTSTRAP)) || ! "$interpreter" -c 'import torch' >/dev/null 2>&1; then
+  if ((FORCE_BOOTSTRAP)) || ! torch_supports_local_gpu "$interpreter"; then
+    if "$interpreter" -c 'import torch' >/dev/null 2>&1; then
+      printf 'The installed PyTorch has no kernels for this GPU; reinstalling.\n'
+      report_gpu_mismatch "$interpreter"
+    fi
     printf 'Installing PyTorch from %s (multi-GB download; progress follows)\n' "$PYTORCH_INDEX_URL"
-    "$interpreter" -m pip install --progress-bar "$progress" torch torchvision \
-      --index-url "$PYTORCH_INDEX_URL"
+    # --force-reinstall: pip would otherwise treat a wrong-architecture build as satisfying.
+    "$interpreter" -m pip install --progress-bar "$progress" --force-reinstall \
+      torch torchvision --index-url "$PYTORCH_INDEX_URL"
   fi
   "$interpreter" -m pip install --progress-bar "$progress" -e "${REPO_ROOT}[reports]"
 }
