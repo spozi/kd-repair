@@ -301,7 +301,7 @@ class FakeCaltech101(Dataset):
         return len(self.y)
 
     def __getitem__(self, index):
-        return self.transform(Image.new("RGB", (40, 30))), self.y[index]
+        return self.transform(Image.new("L", (40, 30))), self.y[index]
 
 
 class FakeSTL10(Dataset):
@@ -421,6 +421,8 @@ class CatalogDataTests(unittest.TestCase):
         self.assertEqual(len(train_indices | val_indices | test_indices), 1010)
         self.assertEqual(first.test.dataset.indices, second.test.dataset.indices)
         self.assertEqual(first.provenance["test_per_class"], [2] * 101)
+        images, _ = next(iter(first.train))
+        self.assertEqual(tuple(images.shape[1:]), (3, 32, 32))
 
     def test_stl10_loader_downsamples_without_touching_test(self):
         with patch("kd.data.datasets.STL10", FakeSTL10):
