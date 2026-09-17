@@ -30,6 +30,10 @@ CATALOG_SOURCES = {
 }
 
 
+def _ensure_rgb(image: Image.Image) -> Image.Image:
+    return image.convert("RGB")
+
+
 def normalization(source: str):
     # Fixed [-1, 1] scaling for CIFAR: no validation/test statistics are fitted.
     fixed = {
@@ -72,7 +76,8 @@ def image_transform(config: DataConfig, *, training: bool):
                                transforms.RandomApply([transforms.GaussianBlur(3)], p=0.2)])
     else:
         operations = [transforms.Resize(size + max(2, size // 8)), transforms.CenterCrop(size)]
-    return transforms.Compose([*operations, transforms.ToTensor(), transforms.Normalize(mean, std)])
+    return transforms.Compose([*operations, transforms.Lambda(_ensure_rgb),
+                               transforms.ToTensor(), transforms.Normalize(mean, std)])
 
 
 class FashionMNISTFiles(Dataset):
