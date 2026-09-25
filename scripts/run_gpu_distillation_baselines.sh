@@ -19,6 +19,8 @@ JOBS_CSV="${JOBS:-}"
 STATUS_INTERVAL="${STATUS_INTERVAL:-60}"
 SKIP_PREFLIGHT=0
 SKIP_FETCH=0
+FETCH_JOBS="${FETCH_JOBS:-3}"
+MIRRORS=()
 DRY_RUN_ONLY=0
 
 export PYTHONUNBUFFERED=1
@@ -46,6 +48,11 @@ Options:
   --skip-fetch          Reuse already prepared datasets instead of fetching and verifying
   --registry-url URL    Dataset-registry Git URL (default: the public HTTPS registry)
   --registry-ref REF    Immutable dataset catalog tag (default: catalog-v1.2.0)
+  --mirror URL          Extra base URL serving the registry tree; repeat for several.
+                        Each archive comes from the fastest of registry, mirrors and
+                        upstream, switching mid-download if one slows (also settable
+                        with KD_DATASET_MIRRORS)
+  --fetch-jobs N        Datasets downloaded at once (default: 3)
   --methods NAMES       Comma-separated subset of dkd,rld,loca (default: all three)
   --jobs IDS            Comma-separated study ids (default: every completed study)
   --python PATH         Python interpreter of the pinned environment (default: python)
@@ -70,6 +77,8 @@ while (($#)); do
     --skip-fetch) SKIP_FETCH=1; shift ;;
     --registry-url) REGISTRY_URL="$2"; shift 2 ;;
     --registry-ref) REGISTRY_REF="$2"; shift 2 ;;
+    --mirror) MIRRORS+=("$2"); shift 2 ;;
+    --fetch-jobs) FETCH_JOBS="$2"; shift 2 ;;
     --gpu-ids) GPU_IDS_CSV="$2"; shift 2 ;;
     --runs-per-gpu) RUNS_PER_GPU="$2"; shift 2 ;;
     --min-free-mib) MIN_FREE_MIB="$2"; shift 2 ;;
@@ -85,15 +94,18 @@ while (($#)); do
   esac
 done
 
-for name in RUNS_PER_GPU MIN_FREE_MIB LAUNCH_GAP STATUS_INTERVAL; do
+for name in RUNS_PER_GPU MIN_FREE_MIB LAUNCH_GAP STATUS_INTERVAL FETCH_JOBS; do
   if [[ ! "${!name}" =~ ^[0-9]+$ ]]; then
     printf '%s must be a nonnegative integer; received: %s\n' "$name" "${!name}" >&2
     exit 2
   fi
 done
-if ((RUNS_PER_GPU < 1)); then
-  printf '%s\n' '--runs-per-gpu must be at least 1.' >&2
+if ((RUNS_PER_GPU < 1 || FETCH_JOBS < 1)); then
+  printf '%s\n' '--runs-per-gpu and --fetch-jobs must be at least 1.' >&2
   exit 2
+fi
+if ((${#MIRRORS[@]})); then
+  export KD_DATASET_MIRRORS="${MIRRORS[*]}"
 fi
 if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
   printf '%s\n' 'Bash 4.4 or newer is required.' >&2
@@ -198,15 +210,46 @@ if ((SKIP_FETCH == 0)); then
   log_stage 'Preparing datasets'
   git lfs version
   "$PYTHON_BIN" -m kd dataset registry-config --url "$REGISTRY_URL" --ref "$REGISTRY_REF"
-  declare -A FETCHED=()
+  "$PYTHON_BIN" -m kd dataset registry-status
+  declare -A FETCHED=() FETCH_PIDS=()
+  FETCH_LIST=()
   for pair in "${DATASET_PROFILES[@]}"; do
     dataset="${pair% *}"
     if [[ -z "${FETCHED[$dataset]:-}" ]]; then
-      printf '[%s] fetching %s\n' "$(timestamp)" "$dataset"
-      "$PYTHON_BIN" -m kd dataset fetch "$dataset" --profile balanced --root "$DATA_ROOT"
       FETCHED[$dataset]=1
+      FETCH_LIST+=("$dataset")
     fi
   done
+  # Datasets come from different hosts, so overlapping them adds their bandwidth. An HTTPS
+  # registry needs no shared Git checkout, so concurrent fetches never touch the same files.
+  fetch_one() {
+    local dataset="$1" line
+    "$PYTHON_BIN" -m kd dataset fetch "$dataset" --profile balanced --root "$DATA_ROOT" \
+      2>&1 >"${LOG_DIR}/fetch-${dataset}.json" \
+      | while IFS= read -r line; do printf '[%s] %s\n' "$dataset" "$line"; done
+    return "${PIPESTATUS[0]}"
+  }
+  printf 'Fetching %s datasets, %s at a time\n' "${#FETCH_LIST[@]}" "$FETCH_JOBS"
+  for dataset in "${FETCH_LIST[@]}"; do
+    while :; do
+      running=0
+      for pid in "${FETCH_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then running=$((running + 1)); fi
+      done
+      ((running < FETCH_JOBS)) && break
+      sleep 1
+    done
+    fetch_one "$dataset" &
+    FETCH_PIDS[$dataset]=$!
+  done
+  FETCH_FAILED=()
+  for dataset in "${FETCH_LIST[@]}"; do
+    wait "${FETCH_PIDS[$dataset]}" || FETCH_FAILED+=("$dataset")
+  done
+  if ((${#FETCH_FAILED[@]})); then
+    printf 'Dataset fetch failed: %s. Rerun to resume partial downloads.\n' "${FETCH_FAILED[*]}" >&2
+    exit 1
+  fi
   for pair in "${DATASET_PROFILES[@]}"; do
     "$PYTHON_BIN" -m kd dataset verify "${pair% *}" --profile "${pair#* }" --root "$DATA_ROOT"
   done
