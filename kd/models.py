@@ -50,12 +50,22 @@ class TinyCNN(VisionModel):
 
 
 class ResNetAdapter(VisionModel):
-    """Adapter for torchvision ResNets, including differing stage widths/depths."""
+    """Adapter for torchvision ResNets, including differing stage widths/depths.
 
-    def __init__(self, name: str, num_classes: int):
+    The ImageNet stem (7x7 stride-2 convolution, then stride-2 max-pooling) reduces a 32x32
+    image to 8x8 before the first residual stage. ``cifar_stem`` replaces it with the standard
+    CIFAR stem, a 3x3 stride-1 convolution without pooling, and leaves the stages unchanged.
+    """
+
+    def __init__(self, name: str, num_classes: int, *, cifar_stem: bool = False):
         super().__init__()
         builders = {"resnet18": models.resnet18, "resnet34": models.resnet34, "resnet50": models.resnet50}
         self.backbone = builders[name](weights=None, num_classes=num_classes)
+        if cifar_stem:
+            self.backbone.conv1 = nn.Conv2d(3, 64, 3, stride=1, padding=1, bias=False)
+            # torchvision's own initialization for its convolutions.
+            nn.init.kaiming_normal_(self.backbone.conv1.weight, mode="fan_out", nonlinearity="relu")
+            self.backbone.maxpool = nn.Identity()
         expansion = 4 if name == "resnet50" else 1
         self.feature_channels = {f"stage{i}": width * expansion
                                  for i, width in enumerate((64, 128, 256, 512), start=1)}
@@ -101,7 +111,7 @@ class CifarCNN(VisionModel):
 
 
 MODEL_NAMES = ("tiny_small", "tiny_medium", "tiny_large", "resnet18", "resnet34", "resnet50",
-               "cifar_student", "cifar_teacher")
+               "cifar_student", "cifar_teacher", "cifar_resnet18", "cifar_resnet34", "cifar_resnet50")
 
 
 def create_model(name: str, num_classes: int) -> VisionModel:
@@ -112,6 +122,8 @@ def create_model(name: str, num_classes: int) -> VisionModel:
         return TinyCNN(tiny_widths[name], num_classes)
     if name in {"cifar_student", "cifar_teacher"}:
         return CifarCNN(16 if name == "cifar_student" else 32, num_classes)
+    if name.startswith("cifar_resnet") and name in MODEL_NAMES:
+        return ResNetAdapter(name.removeprefix("cifar_"), num_classes, cifar_stem=True)
     if name in MODEL_NAMES:
         return ResNetAdapter(name, num_classes)
     raise ValueError(f"Unknown model {name!r}; choose from {MODEL_NAMES}")

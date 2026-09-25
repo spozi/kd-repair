@@ -74,6 +74,18 @@ class GeneralizedLocalizationTests(unittest.TestCase):
         self.assertTrue(masks["backbone.fc.weight"][:, 7].all())
         self.assertFalse(masks["backbone.conv1.weight"].any())
 
+    def test_cifar_stem_resnet_repairs_the_same_late_stage_parameters(self):
+        channels = [{"stage": "stage3", "channel": 3}, {"stage": "stage4", "channel": 7}]
+        for name in ("cifar_resnet18", "cifar_resnet34", "cifar_resnet50"):
+            cifar, imagenet = create_model(name, 10), create_model(name.removeprefix("cifar_"), 10)
+            self.assertEqual(localization_stages(cifar), ("stage3", "stage4"))
+            cifar_masks = resnet_channel_parameter_masks(cifar, channels)
+            imagenet_masks = resnet_channel_parameter_masks(imagenet, channels)
+            for key, mask in imagenet_masks.items():
+                if not key.startswith("backbone.conv1"):
+                    self.assertTrue(torch.equal(cifar_masks[key], mask), (name, key))
+            self.assertFalse(cifar_masks["backbone.conv1.weight"].any())
+
     def test_resnet50_map_uses_terminal_bottleneck_convolution(self):
         model = create_model("resnet50", 10)
         masks = resnet_channel_parameter_masks(

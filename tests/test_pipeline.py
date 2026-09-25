@@ -107,6 +107,26 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(result.logits.shape, (2, 3))
         self.assertEqual({name: f.shape[1] for name, f in result.features.items()}, model.feature_channels)
 
+    def test_cifar_resnet_keeps_32x32_spatial_detail_and_the_imagenet_resnet_does_not(self):
+        images = torch.randn(2, 3, 32, 32)
+        sizes = {}
+        for name in ("resnet18", "cifar_resnet18"):
+            model = create_model(name, 3).eval()
+            with torch.inference_mode():
+                result = model(images, return_features=True)
+            self.assertEqual(result.logits.shape, (2, 3))
+            sizes[name] = [feature.shape[-1] for feature in result.features.values()]
+        self.assertEqual(sizes["resnet18"], [8, 4, 2, 1])
+        self.assertEqual(sizes["cifar_resnet18"], [32, 16, 8, 4])
+        cifar, imagenet = create_model("cifar_resnet18", 3), create_model("resnet18", 3)
+        self.assertEqual(cifar.feature_channels, imagenet.feature_channels)
+        # Only the stem differs: identical parameter names and stage shapes.
+        self.assertEqual(
+            {k: v.shape for k, v in cifar.state_dict().items() if not k.startswith("backbone.conv1")},
+            {k: v.shape for k, v in imagenet.state_dict().items() if not k.startswith("backbone.conv1")})
+        self.assertEqual(cifar.backbone.conv1.kernel_size, (3, 3))
+        self.assertIsInstance(cifar.backbone.maxpool, torch.nn.Identity)
+
     def test_benchmark_and_budget_use_student_inference_only(self):
         model = create_model("tiny_small", 4)
         result = benchmark(model, 32, torch.device("cpu"), BenchmarkConfig(warmup=0, iterations=2))
