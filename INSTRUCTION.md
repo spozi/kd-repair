@@ -72,8 +72,10 @@ scripts/run_gpu_distillation_baselines.sh --dry-run-only
 scripts/run_gpu_distillation_baselines.sh --skip-fetch --runs-per-gpu 4
 ```
 
-- The dry run downloads and verifies the 11 datasets into `data/`, and checks that all 69 runs are
-  set up correctly, without training.
+- The dry run downloads and verifies the 11 datasets into `data/`, three at a time, and checks that
+  all 69 runs are set up correctly, without training. Each archive comes from whichever of Gitea
+  and the dataset's original host is fastest from the server; the log shows the measured speeds.
+  If a download slows down, it switches to the other source at the same byte.
 - The second command trains. It keeps up to four runs on each GPU, and starts another only while
   the GPU has at least 3 GB free.
 - Detach with `Ctrl-b` then `d`. Reattach with `tmux attach -t baselines`.
@@ -113,6 +115,7 @@ nvidia-smi dmon                                    # GPU utilization; `top` for 
 | GPU and CPU both have room | `Ctrl-c`, restart with `--runs-per-gpu 6` |
 | A run reports `FAILED` | Let the others finish, read its log in `logs/distillation-baselines/`, then rerun the same command |
 | Server rebooted or the job was stopped | Rerun the same command |
+| Every dataset source is slow from this server | Add a closer mirror with `--mirror URL` (see [`docs/dataset-registry.md`](docs/dataset-registry.md#source-selection-and-mirrors)); partial downloads resume |
 
 Stopping and rerunning is always safe: finished students are kept and interrupted epochs resume.
 
