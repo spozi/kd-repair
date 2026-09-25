@@ -1,0 +1,12 @@
+# Pinned runtime for NVIDIA GPU servers. torch 2.14.0 is the latest PyTorch release and
+# CUDA 13.2 the newest CUDA it ships stable wheels for. Experiment 1 ran on exactly this
+# build (torch 2.14.0+cu132, numpy 2.5.2, Python 3.12), so new students stay matched to its
+# controls. The wheels bundle the CUDA runtime and cuDNN: the server needs only a driver
+# that supports CUDA 13 (R580 or newer).
+--extra-index-url https://download.pytorch.org/whl/cu132
+torch==2.14.0+cu132
+torchvision==0.29.0+cu132
+numpy==2.5.2
+scipy==1.18.1
+pillow==12.3.0
+matplotlib==3.11.2

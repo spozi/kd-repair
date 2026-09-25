@@ -53,10 +53,14 @@ The implementation was verified on Python 3.12.12, PyTorch `2.14.0.dev20260618`,
 
 ## NVIDIA CUDA servers
 
-Install a CUDA-enabled PyTorch build appropriate for the server, then verify the complete optimized
-path rather than relying only on `torch.cuda.is_available()`:
+Create the pinned environment (Python 3.12, PyTorch 2.14.0 with CUDA 13.2, the build Experiment 1
+ran on) from [`environment.yml`](environment.yml), or install
+[`requirements-cuda.txt`](requirements-cuda.txt) into any Python 3.12 virtualenv. Then verify the
+complete optimized path rather than relying only on `torch.cuda.is_available()`:
 
 ```bash
+conda env create -f environment.yml
+conda activate kd
 nvidia-smi
 python -m kd cuda-check --device cuda:0 --precision auto
 ```
