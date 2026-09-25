@@ -252,10 +252,10 @@ class ExperimentConfig:
                 raise ValueError("CPC currently requires standard KD with cross-entropy supervision")
             if self.calibration.enabled or d.feature_weight:
                 raise ValueError("CPC cannot be combined with MMCE or feature losses in this experiment")
-        if self.supervised_loss.method != "cross_entropy" and d.method == "kd" and d.weight == 1:
+        if self.supervised_loss.method != "cross_entropy" and d.method in {"kd", "loca"} and d.weight == 1:
             raise ValueError("Adaptive supervised losses require a nonzero supervised weight in KD")
-        if d.method not in {"supervised", "kd", "dkd"}:
-            raise ValueError("distillation.method must be supervised, kd, or dkd")
+        if d.method not in {"supervised", "kd", "dkd", "rld", "loca"}:
+            raise ValueError("distillation.method must be supervised, kd, dkd, rld, or loca")
         for name, value in {"temperature": d.temperature, "learning_rate": self.train.learning_rate}.items():
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
