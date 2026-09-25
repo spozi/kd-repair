@@ -127,6 +127,19 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(cifar.backbone.conv1.kernel_size, (3, 3))
         self.assertIsInstance(cifar.backbone.maxpool, torch.nn.Identity)
 
+    def test_he_cifar_resnets_have_the_standard_depth_and_size(self):
+        images = torch.randn(2, 3, 32, 32)
+        for name, depth, parameters in (("resnet8", 8, (70_000, 90_000)), ("resnet20", 20, (260_000, 290_000))):
+            model = create_model(name, 10).eval()
+            convolutions = [m for m in model.modules() if isinstance(m, torch.nn.Conv2d) and m.kernel_size == (3, 3)]
+            self.assertEqual(len(convolutions) + 1, depth)  # 3x3 convolutions plus the classifier
+            self.assertTrue(parameters[0] < sum(p.numel() for p in model.parameters()) < parameters[1])
+            with torch.inference_mode():
+                result = model(images, return_features=True)
+            self.assertEqual(result.logits.shape, (2, 10))
+            self.assertEqual([f.shape[-1] for f in result.features.values()], [32, 16, 8])
+            self.assertEqual({k: f.shape[1] for k, f in result.features.items()}, model.feature_channels)
+
     def test_benchmark_and_budget_use_student_inference_only(self):
         model = create_model("tiny_small", 4)
         result = benchmark(model, 32, torch.device("cpu"), BenchmarkConfig(warmup=0, iterations=2))
