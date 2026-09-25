@@ -287,7 +287,7 @@ bootstrap_conda() {
     printf 'Creating Conda environment %s with python %s\n' "$CONDA_ENV" "$PYTHON_VERSION"
     # Mirrors environment.yml's Conda layer. Its pip layer follows in ensure_requirements,
     # where pip progress streams live and a wrong-architecture wheel is caught.
-    conda create -n "$CONDA_ENV" "python=$PYTHON_VERSION" pip git-lfs -c conda-forge -y
+    conda create -n "$CONDA_ENV" "python=$PYTHON_VERSION" pip git-lfs zstd -c conda-forge -y
   fi
   local resolved
   resolved="$(conda run -n "$CONDA_ENV" --no-capture-output \
