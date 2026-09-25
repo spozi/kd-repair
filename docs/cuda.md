@@ -128,25 +128,31 @@ python -m kd distillation-baselines --matrix runs/experiment1-multidataset --dry
 python -m kd distillation-baselines --matrix runs/experiment1-multidataset
 ```
 
-To use several GPUs, give each process a disjoint job list; each control's recorded device is
-`cuda:0`, so select the physical GPU with `CUDA_VISIBLE_DEVICES`:
+### Several runs per GPU
+
+A baseline student is tiny (74k parameters on small images), and Experiment 1 epochs took about
+1.5 s at the protocol batch size of 128, so a single run leaves a 16 GB GPU mostly idle. Do not raise the batch
+size or change the optimizer to fill it: every baseline student must keep its classical-KD control's
+batch size, learning rate, schedule, and precision, or the comparison stops isolating the
+distillation loss. Instead, run several independent students side by side:
 
 ```bash
-jobs=($(python -c 'import json; print(*[j["id"] for j in json.load(open("runs/experiment1-multidataset/matrix_summary.json"))["jobs"] if j["status"] == "complete"])'))
-gpus=(0 1 2 3)
-mkdir -p logs
-for i in "${!gpus[@]}"; do
-  mine=(); for j in "${!jobs[@]}"; do ((j % ${#gpus[@]} == i)) && mine+=("${jobs[j]}"); done
-  CUDA_VISIBLE_DEVICES=${gpus[i]} nohup python -m kd distillation-baselines \
-    --matrix runs/experiment1-multidataset --jobs "${mine[@]}" \
-    > logs/distillation-baselines-gpu${gpus[i]}.log 2>&1 &
-done
-wait
-python scripts/baseline_comparison_table.py --matrix runs/experiment1-multidataset \
-  --output docs/distillation-baselines-results.md
+scripts/run_gpu_distillation_baselines.sh --runs-per-gpu 4
 ```
 
-The last command regenerates [the results table](distillation-baselines-results.md).
+The launcher splits the work into 69 runs (23 studies x DKD, RLD, LoCa; three seeds each) and keeps
+up to `--runs-per-gpu` of them on every GPU. A GPU that is already busy takes another run only while
+it has `--min-free-mib` (default 3072) free, checked `--launch-gap` seconds (default 30) after its
+previous start so that run's memory is visible first. Each run writes only its own
+`baselines/distillation/<method>/` directory, so concurrent runs never share files. Per-run logs
+and a status report every minute go to `logs/distillation-baselines/`. When every run succeeds the
+launcher regenerates [the results table](distillation-baselines-results.md); after a failure or an
+interruption, rerun the same command to resume.
+
+Each run also starts the control's four data-loader workers, so four runs on each of four GPUs need
+about 80 CPU cores. The launcher warns when the slots exceed the machine's cores. If `nvidia-smi
+dmon` then shows low GPU utilization, lower `--runs-per-gpu`. Use `--dry-run-only` to check every
+protocol before renting time on the GPU.
 
 ## Other studies
 
