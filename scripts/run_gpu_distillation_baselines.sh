@@ -51,7 +51,8 @@ Options:
   --python PATH         Python interpreter of the pinned environment (default: python)
   --skip-preflight      Skip the per-GPU CUDA check
   --dry-run-only        Validate every study's baseline protocol without training
-  --status-interval N   Seconds between status reports; 0 disables (default: 60)
+  --status-interval N   Seconds between status reports with a progress bar and ETA;
+                        0 disables (default: 60)
   -h, --help            Show this help
 
 One run is one (study, method) pair: three students trained in turn, then scored. Runs
@@ -302,23 +303,29 @@ reap() {
   done
 }
 
+# Progress comes from files the runs write every epoch, so it stays correct across restarts.
+progress() {
+  "$PYTHON_BIN" scripts/baseline_progress.py --matrix "$MATRIX" --jobs "$JOBS_CSV" \
+    --methods "$METHODS_CSV" "$@"
+}
+
 status() {
-  local now gpu pid index last
+  local now gpu
   now="$(date +%s)"
-  printf '[%s] status: %s/%s finished (%s failed), %s running, elapsed %s\n' "$(timestamp)" \
+  printf '[%s] status: %s/%s runs ended (%s failed), %s running, elapsed %s\n' "$(timestamp)" \
     "$finished" "$TOTAL_RUNS" "$failures" "${#PID_RUN[@]}" "$(format_elapsed $((now - QUEUE_START)))"
+  progress --baseline-work "$PROGRESS_BASE" --elapsed $((now - QUEUE_START)) \
+    | sed 's/^/    /' || true
   for gpu in "${GPU_IDS_ARRAY[@]}"; do
     printf '    GPU %s: %s runs, %s MiB used\n' "$gpu" "${GPU_ACTIVE[$gpu]}" "$(used_mib "$gpu")"
-  done
-  for pid in "${!PID_RUN[@]}"; do
-    index="${PID_RUN[$pid]}"
-    last="$(tail -n 20 "$(run_log "$index")" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1 || true)"
-    printf '      %-22s %-4s %s  %s\n' "${RUN_JOBS[$index]}" "${RUN_METHODS[$index]}" \
-      "$(format_elapsed $((now - PID_START[$pid])))" "${last:0:80}"
   done
 }
 
 log_stage "Running ${TOTAL_RUNS} runs"
+# Work already on disk (from an earlier, interrupted session) is excluded from the ETA rate.
+PROGRESS_BASE="$(progress --count | cut -f1)" || true
+PROGRESS_BASE="${PROGRESS_BASE:-0}"
+progress | sed 's/^/    /' || true
 while ((next_run < TOTAL_RUNS || ${#PID_RUN[@]})); do
   reap
   # Fill at most one slot per GPU per pass, so each start is measured before the next.
@@ -336,6 +343,8 @@ while ((next_run < TOTAL_RUNS || ${#PID_RUN[@]})); do
 done
 
 printf '\nAll runs ended in %s\n' "$(format_elapsed $(($(date +%s) - QUEUE_START)))"
+progress --baseline-work "$PROGRESS_BASE" --elapsed $(($(date +%s) - QUEUE_START)) \
+  | sed 's/^/    /' || true
 if ((failures)); then
   printf '%s of %s runs failed. Rerun the same command to resume them.\n' "$failures" "$TOTAL_RUNS" >&2
   exit 1
