@@ -1,8 +1,8 @@
 # Running the distillation baselines on a rented GPU
 
 These steps train the DKD, RLD and LoCa baseline students for the 23 Experiment 1 studies that
-produced a repaired teacher, then fill in
-[`docs/distillation-baselines-results.md`](docs/distillation-baselines-results.md). The work is
+produced a repaired teacher, then write the results table to `docs/distillation-baselines-results.md`.
+That file is generated locally and kept out of git, because this repository is public. The work is
 69 runs of three students each. Every student keeps the training settings of the classical-KD
 student it is compared with (batch size 128, same schedule and precision), so the comparison
 changes only the distillation loss.

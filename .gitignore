@@ -10,3 +10,8 @@ logs/
 checkpoints/
 .codegraph/
 
+
+# Experiment results stay local: this repository is public.
+docs/distillation-baselines-results.md
+docs/distillation-baselines-statistics.md
+docs/distillation-baselines-comparison.md

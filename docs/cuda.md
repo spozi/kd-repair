@@ -189,7 +189,8 @@ weighted by training images, an ETA, and each active run's student and epoch.
 `python scripts/baseline_progress.py --watch 30` draws the same bar from another shell; it reads
 only the `history.json`, `completion.json`, and `comparison.json` files the runs write, so its
 counts survive restarts. When every run succeeds the
-launcher regenerates [the results table](distillation-baselines-results.md); after a failure or an
+launcher regenerates the results table, `docs/distillation-baselines-results.md` (local only, never
+committed, because the repository is public); after a failure or an
 interruption, rerun the same command to resume.
 
 Each run also starts the control's four data-loader workers, so four runs on each of four GPUs need
