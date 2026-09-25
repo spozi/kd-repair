@@ -184,7 +184,11 @@ up to `--runs-per-gpu` of them on every GPU. A GPU that is already busy takes an
 it has `--min-free-mib` (default 3072) free, checked `--launch-gap` seconds (default 30) after its
 previous start so that run's memory is visible first. Each run writes only its own
 `baselines/distillation/<method>/` directory, so concurrent runs never share files. Per-run logs
-and a status report every minute go to `logs/distillation-baselines/`. When every run succeeds the
+go to `logs/distillation-baselines/`, and a status report every minute shows a progress bar
+weighted by training images, an ETA, and each active run's student and epoch.
+`python scripts/baseline_progress.py --watch 30` draws the same bar from another shell; it reads
+only the `history.json`, `completion.json`, and `comparison.json` files the runs write, so its
+counts survive restarts. When every run succeeds the
 launcher regenerates [the results table](distillation-baselines-results.md); after a failure or an
 interruption, rerun the same command to resume.
 
