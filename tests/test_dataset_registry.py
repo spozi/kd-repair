@@ -471,6 +471,7 @@ class _Archives(BaseHTTPRequestHandler):
     def do_GET(self):
         server = self.server
         server.requests.append((self.path, self.headers.get("Range")))
+        time.sleep(server.stall.get(self.path, 0.0))
         body = server.files.get(self.path)
         if body is None:
             self.send_error(404)
@@ -499,10 +500,12 @@ class _Archives(BaseHTTPRequestHandler):
 
 
 @contextmanager
-def _serve(files: dict, throttle: dict | None = None):
-    """Yield (server, base URL); throttle maps a path to (seconds per 64 KiB, from byte)."""
+def _serve(files: dict, throttle: dict | None = None, stall: dict | None = None):
+    """Yield (server, base URL); throttle maps a path to (seconds per 64 KiB, from byte), and
+    stall maps a path to seconds of silence before the response starts."""
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Archives)
     server.files, server.throttle, server.requests = files, throttle or {}, []
+    server.stall = stall or {}
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -555,6 +558,15 @@ class SourceSelectionTests(unittest.TestCase):
         # The mirror was only probed, never downloaded in full.
         mirror = [header for path, header in server.requests if path == self.ARCHIVE]
         self.assertEqual(mirror, [f"bytes=0-{128 * 1024 - 1}"])
+
+    def test_a_source_slow_to_answer_is_ranked_by_how_fast_it_streams(self):
+        files = {"/upstream.bin": self.PAYLOAD, self.ARCHIVE: self.PAYLOAD}
+        # The preferred mirror streams steadily at about 1.3 MB/s; upstream is silent for a
+        # second, then streams at full speed, as a registry doing an LFS lookup does.
+        with _serve(files, {self.ARCHIVE: (0.05, 0)}, {"/upstream.bin": 1.0}) as (_, base):
+            result = self._fetch(f"{base}/upstream.bin", f"{base}/mirror")
+        self.assertEqual(result["artifacts"][0]["source"], "upstream")
+        self.assertEqual(self._fetched(), self.PAYLOAD)
 
     def test_a_source_that_slows_down_hands_over_at_the_same_byte(self):
         files = {"/upstream.bin": self.PAYLOAD, self.ARCHIVE: self.PAYLOAD}

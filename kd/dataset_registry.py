@@ -393,9 +393,13 @@ def _host(url: str) -> str:
 
 
 def _probe(url: str) -> float:
-    """Bytes per second over a short ranged download, or 0.0 when the source fails."""
+    """Sustained bytes per second over a short ranged download, or 0.0 when the source fails.
+
+    Timing starts at the first byte, so a source that is slow to answer (TLS, redirects, an
+    LFS lookup) but fast to stream is ranked by the rate that dominates a large archive.
+    """
     request = Request(url, headers={"User-Agent": USER_AGENT, "Range": f"bytes=0-{PROBE_BYTES - 1}"})
-    started, received = time.monotonic(), 0
+    started, received, first = time.monotonic(), 0, None
     try:
         with urlopen(request, timeout=PROBE_SECONDS) as response:
             read = getattr(response, "read1", response.read)
@@ -404,9 +408,16 @@ def _probe(url: str) -> float:
                 if not block:
                     break
                 received += len(block)
+                if first is None:
+                    first = (time.monotonic(), received)
     except (OSError, ValueError, HTTPException):
         return 0.0
-    return received / max(time.monotonic() - started, 1e-6)
+    now = time.monotonic()
+    if first is None:
+        return 0.0
+    if received > first[1] and now > first[0]:
+        return (received - first[1]) / (now - first[0])
+    return received / max(now - started, 1e-6)  # everything arrived in one block
 
 
 def _rank_sources(sources: list[tuple[str, str]], size: int | None,
