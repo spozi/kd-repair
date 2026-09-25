@@ -24,7 +24,10 @@ def _completed_study(root: Path) -> Path:
     study = root / "synthetic" / "lt" / "studies" / "confirmatory"
     teacher_config = ExperimentConfig(
         name=f"teacher_{JOB}", output_dir=str(baseline),
-        data=DataConfig(num_classes=3, train_samples=12, val_samples=6, test_samples=6),
+        # Synthetic data needs no files, but the runner requires its root to exist; anchor it
+        # here rather than on whatever `data/` the working directory happens to hold.
+        data=DataConfig(root=str(root), num_classes=3, train_samples=12, val_samples=6,
+                        test_samples=6),
         student=ModelConfig("tiny_medium"), distillation=DistillationConfig(method="supervised"),
         train=TrainConfig(epochs=1, batch_size=6, device="cpu", threads=1),
         benchmark=BenchmarkConfig(warmup=0, iterations=1))
