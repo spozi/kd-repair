@@ -137,6 +137,20 @@ def main(argv=None) -> None:
                                  default="auto")
     student_surgery.add_argument("--seeds", type=int, nargs="+", default=[142, 143, 144])
     student_surgery.add_argument("--dry-run", action="store_true")
+    distillation_baselines = subparsers.add_parser(
+        "distillation-baselines",
+        help="Distil each repaired study's matched students with DKD, RLD and LoCa and score them")
+    distillation_baselines.add_argument("--matrix", required=True,
+                                        help="Matrix output root containing matrix_summary.json")
+    distillation_baselines.add_argument("--jobs", nargs="+", default=None,
+                                        help="Restrict to these job ids (default: every completed study)")
+    distillation_baselines.add_argument("--methods", nargs="+", choices=("dkd", "rld", "loca"),
+                                        default=["dkd", "rld", "loca"])
+    distillation_baselines.add_argument("--device", type=device_spec, default=None,
+                                        help="Override the controls' device (default: keep it)")
+    distillation_baselines.add_argument("--data-root", default=None,
+                                        help="Override the controls' dataset root")
+    distillation_baselines.add_argument("--dry-run", action="store_true")
     dataset = subparsers.add_parser("dataset", help="List, fetch, or verify versioned datasets")
     dataset_commands = dataset.add_subparsers(dest="dataset_command", required=True)
     dataset_commands.add_parser("list", help="List datasets and profiles in the built-in catalog")
@@ -210,6 +224,11 @@ def main(argv=None) -> None:
             from .student_surgery_study import run_student_surgery_study
             report = run_student_surgery_study(
                 args.source, args.output, args.device, tuple(args.seeds),
+                dry_run=args.dry_run)
+        elif args.command == "distillation-baselines":
+            from .distillation_baselines import run_matrix_distillation_baselines
+            report = run_matrix_distillation_baselines(
+                args.matrix, tuple(args.methods), args.jobs, args.device, args.data_root,
                 dry_run=args.dry_run)
         elif args.command == "neuron-surgery-baselines":
             from .neuron_surgery_baselines import run_neuron_surgery_baselines
