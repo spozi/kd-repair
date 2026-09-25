@@ -7,6 +7,9 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MATRIX="${MATRIX:-runs/experiment1-multidataset}"
+DATA_ROOT="${DATA_ROOT:-data}"
+REGISTRY_URL="${KD_DATASET_REGISTRY:-https://gitea.izzus.dev/syafiq/kd-repair.git}"
+REGISTRY_REF="${KD_DATASET_REGISTRY_REF:-catalog-v1.2.0}"
 GPU_IDS_CSV="${GPU_IDS:-}"
 RUNS_PER_GPU="${RUNS_PER_GPU:-4}"
 MIN_FREE_MIB="${MIN_FREE_MIB:-3072}"
@@ -15,6 +18,7 @@ METHODS_CSV="${METHODS:-dkd,rld,loca}"
 JOBS_CSV="${JOBS:-}"
 STATUS_INTERVAL="${STATUS_INTERVAL:-60}"
 SKIP_PREFLIGHT=0
+SKIP_FETCH=0
 DRY_RUN_ONLY=0
 
 export PYTHONUNBUFFERED=1
@@ -37,6 +41,11 @@ Options:
                         free memory (default: 3072)
   --launch-gap N        Seconds between starts on the same GPU, so the previous run's
                         memory is visible before the next is admitted (default: 30)
+  --data-root PATH      Dataset directory; replaces the root recorded by the original
+                        server, which is not part of any run's data identity (default: data)
+  --skip-fetch          Reuse already prepared datasets instead of fetching and verifying
+  --registry-url URL    Dataset-registry Git URL (default: the public HTTPS registry)
+  --registry-ref REF    Immutable dataset catalog tag (default: catalog-v1.2.0)
   --methods NAMES       Comma-separated subset of dkd,rld,loca (default: all three)
   --jobs IDS            Comma-separated study ids (default: every completed study)
   --python PATH         Python interpreter of the pinned environment (default: python)
@@ -56,6 +65,10 @@ EOF
 while (($#)); do
   case "$1" in
     --matrix) MATRIX="$2"; shift 2 ;;
+    --data-root) DATA_ROOT="$2"; shift 2 ;;
+    --skip-fetch) SKIP_FETCH=1; shift ;;
+    --registry-url) REGISTRY_URL="$2"; shift 2 ;;
+    --registry-ref) REGISTRY_REF="$2"; shift 2 ;;
     --gpu-ids) GPU_IDS_CSV="$2"; shift 2 ;;
     --runs-per-gpu) RUNS_PER_GPU="$2"; shift 2 ;;
     --min-free-mib) MIN_FREE_MIB="$2"; shift 2 ;;
@@ -99,6 +112,8 @@ fi
 IFS=',' read -r -a METHODS_ARRAY <<< "$METHODS_CSV"
 
 cd "$REPO_ROOT"
+mkdir -p "$DATA_ROOT"
+DATA_ROOT="$(cd -- "$DATA_ROOT" && pwd)"
 LOG_DIR="logs/distillation-baselines"
 mkdir -p "$LOG_DIR"
 SUPERVISOR_LOG="${LOG_DIR}/supervisor-$(date -u +%Y%m%dT%H%M%SZ).log"
@@ -122,19 +137,19 @@ printf 'Matrix:       %s\n' "$MATRIX"
 printf 'GPUs:         %s\n' "$GPU_IDS_CSV"
 printf 'Runs per GPU: %s (admitted while >= %s MiB free)\n' "$RUNS_PER_GPU" "$MIN_FREE_MIB"
 printf 'Methods:      %s\n' "$METHODS_CSV"
+printf 'Data:         %s\n' "$DATA_ROOT"
 printf 'Python:       %s\n' "$PYTHON_BIN"
 printf 'Log:          %s\n' "$SUPERVISOR_LOG"
 
 log_stage 'Planning runs'
-declare -a RUN_JOBS=() RUN_METHODS=()
+declare -a RUN_JOBS=() RUN_METHODS=() DATASET_PROFILES=()
 LOADER_WORKERS=0
 while IFS=$'\t' read -r kind first second; do
-  if [[ "$kind" == workers ]]; then
-    LOADER_WORKERS="$first"
-  else
-    RUN_JOBS+=("$first")
-    RUN_METHODS+=("$second")
-  fi
+  case "$kind" in
+    workers) LOADER_WORKERS="$first" ;;
+    data) DATASET_PROFILES+=("$first $second") ;;
+    run) RUN_JOBS+=("$first"); RUN_METHODS+=("$second") ;;
+  esac
 done < <(MATRIX="$MATRIX" JOBS="$JOBS_CSV" METHODS="$METHODS_CSV" "$PYTHON_BIN" - <<'PY'
 import json
 import os
@@ -153,6 +168,7 @@ for job_id in selected:
     baselines = matrix / job["dataset"] / job["profile"] / "baselines" / "confirmatory"
     for config in baselines.glob("kd_*/config.json"):
         workers = max(workers, json.loads(config.read_text())["train"]["workers"])
+    print(f"data\t{job['dataset']}\t{job['profile']}")
 print(f"workers\t{workers}\t")
 # Method-major order spreads each study's three runs apart, so co-resident runs rarely
 # load the same dataset at once.
@@ -177,9 +193,27 @@ if ((NEEDED > CORES)); then
   printf '%s\n' '         The CPU may become the bottleneck; lower --runs-per-gpu if GPU utilization stays low.'
 fi
 
+if ((SKIP_FETCH == 0)); then
+  log_stage 'Preparing datasets'
+  git lfs version
+  "$PYTHON_BIN" -m kd dataset registry-config --url "$REGISTRY_URL" --ref "$REGISTRY_REF"
+  declare -A FETCHED=()
+  for pair in "${DATASET_PROFILES[@]}"; do
+    dataset="${pair% *}"
+    if [[ -z "${FETCHED[$dataset]:-}" ]]; then
+      printf '[%s] fetching %s\n' "$(timestamp)" "$dataset"
+      "$PYTHON_BIN" -m kd dataset fetch "$dataset" --profile balanced --root "$DATA_ROOT"
+      FETCHED[$dataset]=1
+    fi
+  done
+  for pair in "${DATASET_PROFILES[@]}"; do
+    "$PYTHON_BIN" -m kd dataset verify "${pair% *}" --profile "${pair#* }" --root "$DATA_ROOT"
+  done
+fi
+
 log_stage 'Validating baseline protocols'
 IFS=',' read -r -a SELECTED_JOBS <<< "$JOBS_CSV"
-validate=("$PYTHON_BIN" -m kd distillation-baselines --matrix "$MATRIX" --methods "${METHODS_ARRAY[@]}" --dry-run)
+validate=("$PYTHON_BIN" -m kd distillation-baselines --matrix "$MATRIX" --data-root "$DATA_ROOT" --methods "${METHODS_ARRAY[@]}" --dry-run)
 if ((${#SELECTED_JOBS[@]})); then
   validate+=(--jobs "${SELECTED_JOBS[@]}")
 fi
@@ -223,7 +257,7 @@ launch() {
   local index="$1" gpu="$2" log
   log="$(run_log "$index")"
   CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -m kd distillation-baselines --matrix "$MATRIX" \
-    --jobs "${RUN_JOBS[$index]}" --methods "${RUN_METHODS[$index]}" >"$log" 2>&1 &
+    --data-root "$DATA_ROOT" --jobs "${RUN_JOBS[$index]}" --methods "${RUN_METHODS[$index]}" >"$log" 2>&1 &
   local pid="$!"
   PID_GPU[$pid]="$gpu"
   PID_RUN[$pid]="$index"

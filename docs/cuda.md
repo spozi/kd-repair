@@ -128,6 +128,45 @@ python -m kd distillation-baselines --matrix runs/experiment1-multidataset --dry
 python -m kd distillation-baselines --matrix runs/experiment1-multidataset
 ```
 
+### Deploying on a rented GPU
+
+The baselines need three things on the server: this repository, the Experiment 1 results archive
+(1.3 GB, 1.9 GB extracted; it holds every teacher, control student and cached prediction), and the
+11 datasets its 23 studies use. Rent an RTX 5060 Ti 16 GB or newer whose `nvidia-smi` reports CUDA
+13.0 or later, with 16 or more vCPUs and 20 GB or more of free disk.
+
+From the machine holding the archive:
+
+```bash
+rsync -avP -e "ssh -p PORT" \
+  compiled-results/experiment1-results-all-52-20260917T103004Z.tar.zst USER@HOST:~/
+```
+
+On the server:
+
+```bash
+git clone https://github.com/spozi/kd-repair.git kd-autonomous-car && cd kd-autonomous-car
+conda env create -f environment.yml && conda activate kd
+tar --zstd -xf ~/experiment1-results-all-52-20260917T103004Z.tar.zst
+ls runs/experiment1-multidataset/matrix_summary.json
+python -m kd cuda-check --device cuda:0 --precision auto
+python -m unittest discover -s tests
+tmux new -s baselines                       # keeps the run alive if SSH drops
+scripts/run_gpu_distillation_baselines.sh --dry-run-only
+scripts/run_gpu_distillation_baselines.sh --skip-fetch --runs-per-gpu 4
+```
+
+The dry run fetches and verifies the datasets into `data/` and validates all 69 protocols without
+training. The recorded data root (`/workspace/kd-repair/data`, from the Experiment 1 server) is
+replaced by `--data-root`, which defaults to `data/`; the path is not part of any run's data identity,
+and each new student is still checked against its control's split hashes. Detach with `Ctrl-b d` and
+reattach with `tmux attach -t baselines`. Before releasing the server, copy the results back:
+
+```bash
+tar --zstd -cf baselines-results.tar.zst docs/distillation-baselines-results.md \
+  logs/distillation-baselines runs/experiment1-multidataset/*/*/baselines/distillation
+```
+
 ### Several runs per GPU
 
 A baseline student is tiny (74k parameters on small images), and Experiment 1 epochs took about
