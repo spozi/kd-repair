@@ -1,9 +1,19 @@
-"""Versioned dataset catalog with an optional private Git LFS mirror."""
+"""Versioned dataset catalog with an optional private Git LFS mirror.
+
+Every archive is pinned by the catalog's MD5 (and, when the registry lists it, a SHA-256),
+so any source that serves the same bytes is interchangeable. Downloads rank the private
+registry, any configured mirrors and the canonical upstream by a short speed test, use
+the fastest, and move to another source at the same byte offset when one stalls, fails or
+falls far behind. Mirrors are configured per machine, never in the catalog, because the
+catalog's hash is part of every run's data identity.
+"""
 
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
@@ -13,7 +23,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 import zipfile
 import re
@@ -24,6 +34,18 @@ PROFILES = {"balanced": 1.0, "lt-if10": 10.0, "lt-if50": 50.0, "lt-if100": 100.0
 MARKER = ".kd-dataset.json"
 DEFAULT_REGISTRY_REF = "catalog-v1.2.0"
 REGISTRY_CONFIG_ENV = "KD_DATASET_REGISTRY_CONFIG"
+MIRRORS_ENV = "KD_DATASET_MIRRORS"
+USER_AGENT = "kd-repair-dataset-fetch/1"
+# Sources are ranked by a short ranged download; archives smaller than PROBE_MIN_BYTES skip
+# the test and use preference order, because probing would cost about as much as fetching.
+PROBE_BYTES = 4 * 1024 * 1024
+PROBE_SECONDS = 8.0
+PROBE_MIN_BYTES = 32 * 1024 * 1024
+# A download moves to an untried source, resuming at the same byte, once its rate over the
+# last SLOW_WINDOW seconds falls below SLOW_FRACTION of that source's probed rate.
+SLOW_WINDOW = 30.0
+SLOW_FRACTION = 0.25
+READ_TIMEOUT = 60.0
 
 
 class CatalogError(ValueError):
@@ -58,10 +80,11 @@ def _progress_interval() -> float:
 
 
 def _report_transfer(label: str, copied: int, total: int, elapsed: float, *,
-                     final: bool = False) -> None:
+                     final: bool = False, rate: float | None = None) -> None:
     if not _progress_enabled():
         return
-    rate = copied / elapsed if elapsed > 0 else 0.0
+    if rate is None:
+        rate = copied / elapsed if elapsed > 0 else 0.0
     parts = [_human_bytes(copied)]
     if total:
         parts.append(f"of {_human_bytes(total)} ({100 * copied / total:5.1f}%)")
@@ -74,25 +97,6 @@ def _report_transfer(label: str, copied: int, total: int, elapsed: float, *,
         print(f"\r\x1b[K{line}", end="\n" if final else "", file=sys.stderr, flush=True)
     else:
         print(line, file=sys.stderr, flush=True)
-
-
-def _copy_with_progress(response, handle, label: str, total: int) -> int:
-    copied = 0
-    started = time.monotonic()
-    last_report = started
-    interval = _progress_interval()
-    while True:
-        block = response.read(256 * 1024)
-        if not block:
-            break
-        handle.write(block)
-        copied += len(block)
-        now = time.monotonic()
-        if now - last_report >= interval:
-            last_report = now
-            _report_transfer(label, copied, total, now - started)
-    _report_transfer(label, copied, total, time.monotonic() - started, final=True)
-    return copied
 
 
 def registry_config_path(path: str | Path | None = None) -> Path:
@@ -118,8 +122,38 @@ def _validate_registry_settings(registry: str, ref: str) -> None:
             raise CatalogError("Dataset registry URL must not contain credentials")
 
 
+def _validate_mirror(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https", "file"} or (parsed.scheme != "file" and not parsed.hostname):
+        raise CatalogError(f"Dataset mirror must be an http(s) or file URL: {url}")
+    if parsed.username or parsed.password:
+        raise CatalogError("Dataset mirror URL must not contain credentials")
+    return url.rstrip("/")
+
+
+def _configured_mirrors(location: Path) -> list:
+    if not location.is_file():
+        return []
+    try:
+        return json.loads(location.read_text()).get("mirrors", [])
+    except (OSError, json.JSONDecodeError) as error:
+        raise CatalogError(f"Cannot load dataset registry configuration {location}: {error}") from error
+
+
+def dataset_mirrors(path: str | Path | None = None) -> list[str]:
+    """Base URLs that serve the registry tree (datasets/NAME/VERSION/archives/FILE).
+
+    KD_DATASET_MIRRORS (space- or comma-separated) overrides the persisted list.
+    """
+    value = os.environ.get(MIRRORS_ENV)
+    urls = value.replace(",", " ").split() if value is not None else _configured_mirrors(
+        registry_config_path(path))
+    return [_validate_mirror(url) for url in urls]
+
+
 def configure_registry(registry: str | None = None, ref: str = DEFAULT_REGISTRY_REF, *,
-                       path: str | Path | None = None, remove: bool = False) -> dict:
+                       path: str | Path | None = None, remove: bool = False,
+                       mirrors: list[str] | None = None) -> dict:
     location = registry_config_path(path)
     if remove:
         if registry is not None:
@@ -129,14 +163,17 @@ def configure_registry(registry: str | None = None, ref: str = DEFAULT_REGISTRY_
     if registry is None:
         raise CatalogError("Registry URL is required unless --remove is used")
     _validate_registry_settings(registry, ref)
-    payload = {"schema_version": 1, "registry": registry, "ref": ref}
+    # Launchers rewrite the registry on every run; keep mirrors unless new ones are given.
+    mirrors = [_validate_mirror(url) for url in
+               (_configured_mirrors(location) if mirrors is None else mirrors)]
+    payload = {"schema_version": 1, "registry": registry, "ref": ref, "mirrors": mirrors}
     location.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", dir=location.parent, delete=False) as temporary:
         temporary.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         temporary_path = Path(temporary.name)
     temporary_path.chmod(0o600)
     os.replace(temporary_path, location)
-    return {"configured": True, "registry": registry, "ref": ref,
+    return {"configured": True, "registry": registry, "ref": ref, "mirrors": mirrors,
             "source": "config_file", "path": str(location)}
 
 
@@ -146,10 +183,11 @@ def registry_status(path: str | Path | None = None) -> dict:
         ref = os.environ.get("KD_DATASET_REGISTRY_REF", DEFAULT_REGISTRY_REF)
         _validate_registry_settings(registry, ref)
         return {"configured": True, "registry": registry, "ref": ref,
-                "source": "environment", "path": None}
+                "mirrors": dataset_mirrors(path), "source": "environment", "path": None}
     location = registry_config_path(path)
     if not location.is_file():
-        return {"configured": False, "source": None, "path": str(location)}
+        return {"configured": False, "mirrors": dataset_mirrors(path), "source": None,
+                "path": str(location)}
     try:
         payload = json.loads(location.read_text())
     except (OSError, json.JSONDecodeError) as error:
@@ -159,7 +197,7 @@ def registry_status(path: str | Path | None = None) -> dict:
     registry, ref = payload.get("registry"), payload.get("ref")
     _validate_registry_settings(registry, ref)
     return {"configured": True, "registry": registry, "ref": ref,
-            "source": "config_file", "path": str(location)}
+            "mirrors": dataset_mirrors(path), "source": "config_file", "path": str(location)}
 
 
 def _canonical(value) -> bytes:
@@ -290,7 +328,38 @@ def _registry_checkout(root: Path, registry: str, ref: str) -> Path:
     return checkout
 
 
+def _manifest_records(manifest: dict, recipe: dict) -> dict[str, dict]:
+    """Validate a registry manifest against the public recipe; return its artifact records."""
+    if manifest.get("schema_version") != 1 or manifest.get("recipe_sha256") != sha256_value(recipe):
+        raise RegistryUnavailable("Private mirror manifest does not match the public recipe")
+    records = manifest.get("artifacts", {})
+    for artifact in recipe["artifacts"]:
+        relative = records.get(artifact["id"], {}).get("path")
+        if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+            raise RegistryUnavailable(f"Invalid private mirror path for {artifact['id']}")
+    return records
+
+
+def _registry_web_base(registry: str) -> str | None:
+    """An HTTP(S) Gitea registry also serves raw files and LFS objects over plain HTTPS."""
+    if urlsplit(registry).scheme not in {"http", "https"}:
+        return None
+    base = registry.rstrip("/")
+    return base[:-4] if base.endswith(".git") else base
+
+
+def _registry_manifest(web: str, ref: str, name: str, recipe: dict) -> dict[str, dict]:
+    url = f"{web}/raw/tag/{quote(ref)}/manifests/{quote(name)}/{quote(recipe['version'])}.json"
+    try:
+        with urlopen(Request(url, headers={"User-Agent": USER_AGENT}), timeout=READ_TIMEOUT) as response:
+            manifest = json.loads(response.read())
+    except (OSError, ValueError, HTTPException) as error:
+        raise RegistryUnavailable(f"Private mirror manifest unavailable: {error}") from error
+    return _manifest_records(manifest, recipe)
+
+
 def _mirror_files(root: Path, name: str, recipe: dict) -> dict[str, Path]:
+    """Local or SSH registries: check out the tag and pull the recipe's LFS objects."""
     settings = registry_status()
     if not settings["configured"]:
         return {}
@@ -300,16 +369,8 @@ def _mirror_files(root: Path, name: str, recipe: dict) -> dict[str, Path]:
         manifest = json.loads(manifest_path.read_text())
     except (OSError, json.JSONDecodeError) as error:
         raise RegistryUnavailable(f"Private mirror manifest unavailable: {error}") from error
-    if manifest.get("schema_version") != 1 or manifest.get("recipe_sha256") != sha256_value(recipe):
-        raise RegistryUnavailable("Private mirror manifest does not match the public recipe")
-    records = manifest.get("artifacts", {})
-    paths = []
-    for artifact in recipe["artifacts"]:
-        record = records.get(artifact["id"], {})
-        relative = record.get("path")
-        if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
-            raise RegistryUnavailable(f"Invalid private mirror path for {artifact['id']}")
-        paths.append(relative)
+    records = _manifest_records(manifest, recipe)
+    paths = [records[artifact["id"]]["path"] for artifact in recipe["artifacts"]]
     if (checkout / ".git").exists():
         _run(["git", "lfs", "pull", "--include", ",".join(paths), "--exclude", ""], cwd=checkout,
              env={**os.environ, "GIT_LFS_FORCE_PROGRESS": "1", "GIT_TERMINAL_PROMPT": "0",
@@ -327,19 +388,130 @@ def _mirror_files(root: Path, name: str, recipe: dict) -> dict[str, Path]:
     return result
 
 
-def _download(url: str, destination: Path) -> None:
+def _host(url: str) -> str:
+    return urlsplit(url).netloc or url
+
+
+def _probe(url: str) -> float:
+    """Bytes per second over a short ranged download, or 0.0 when the source fails."""
+    request = Request(url, headers={"User-Agent": USER_AGENT, "Range": f"bytes=0-{PROBE_BYTES - 1}"})
+    started, received = time.monotonic(), 0
+    try:
+        with urlopen(request, timeout=PROBE_SECONDS) as response:
+            read = getattr(response, "read1", response.read)
+            while received < PROBE_BYTES and time.monotonic() - started < PROBE_SECONDS:
+                block = read(64 * 1024)
+                if not block:
+                    break
+                received += len(block)
+    except (OSError, ValueError, HTTPException):
+        return 0.0
+    return received / max(time.monotonic() - started, 1e-6)
+
+
+def _rank_sources(sources: list[tuple[str, str]], size: int | None,
+                  prefix: str) -> list[tuple[str, str, float | None]]:
+    """Order sources fastest first; unreachable ones go last and are kept as a final resort."""
+    if len(sources) < 2 or (size is not None and size < PROBE_MIN_BYTES):
+        return [(label, url, None) for label, url in sources]
+    _status(f"{prefix}: testing the speed of {len(sources)} sources")
+    with ThreadPoolExecutor(len(sources)) as pool:
+        speeds = list(pool.map(_probe, [url for _, url in sources]))
+    for (label, url), speed in zip(sources, speeds):
+        _status(f"      {_host(url)} ({label}): "
+                + (f"{_human_bytes(speed)}/s" if speed else "unreachable"))
+    # sorted() is stable, so equally fast sources keep the preference order.
+    order = sorted(range(len(sources)), key=lambda index: -speeds[index])
+    return [(*sources[index], speeds[index]) for index in order]
+
+
+class _Slow(Exception):
+    """The current source fell far behind an untried one."""
+
+
+def _content_total(response, offset: int) -> int:
+    content_range = response.headers.get("Content-Range", "")
+    if "/" in content_range and content_range.rsplit("/", 1)[1].isdigit():
+        return int(content_range.rsplit("/", 1)[1])
+    length = int(response.headers.get("Content-Length") or 0)
+    return length + offset if length else 0
+
+
+def _stream(url: str, partial: Path, label: str, total: int, switch_below: float) -> None:
+    """Append url's bytes to partial, resuming at its current size when the server allows."""
+    offset = partial.stat().st_size if partial.exists() else 0
+    headers = {"User-Agent": USER_AGENT, **({"Range": f"bytes={offset}-"} if offset else {})}
+    with urlopen(Request(url, headers=headers), timeout=READ_TIMEOUT) as response:
+        if offset and getattr(response, "status", None) != 206:
+            offset = 0  # The server ignored the range, so this source starts from byte zero.
+        total = total or _content_total(response, offset)
+        read = getattr(response, "read1", response.read)
+        with partial.open("ab" if offset else "wb") as handle:
+            started = last_report = time.monotonic()
+            window, copied, interval = deque([(started, offset)]), offset, _progress_interval()
+            rate = 0.0
+            while True:
+                block = read(256 * 1024)
+                if not block:
+                    break
+                handle.write(block)
+                copied += len(block)
+                now = time.monotonic()
+                window.append((now, copied))
+                while len(window) > 2 and now - window[1][0] >= SLOW_WINDOW:
+                    window.popleft()
+                rate = (copied - window[0][1]) / max(now - window[0][0], 1e-6)
+                if now - last_report >= interval:
+                    last_report = now
+                    _report_transfer(label, copied, total, now - started, rate=rate)
+                if switch_below and now - started >= SLOW_WINDOW and rate < switch_below:
+                    raise _Slow(f"{_human_bytes(rate)}/s at {_human_bytes(copied)}")
+            _report_transfer(label, copied, total, time.monotonic() - started, final=True, rate=rate)
+
+
+def _verified(path: Path, md5: str, record: dict) -> bool:
+    if file_hash(path, "md5") != md5:
+        return False
+    return not record.get("sha256") or file_hash(path) == record["sha256"]
+
+
+def _fetch_from_sources(sources: list[tuple[str, str]], destination: Path, md5: str,
+                        record: dict, prefix: str) -> str:
+    """Download destination from the fastest source, switching when one stalls, fails or lags.
+
+    Bytes accumulate in a .part file, so a switch or a rerun resumes rather than restarts;
+    the checksum decides whether the assembled file is kept. Returns the source's label.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
-    request = Request(url, headers={"User-Agent": "kd-repair-dataset-fetch/1"})
-    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as temporary:
-        temporary_path = Path(temporary.name)
+    partial = destination.with_name(destination.name + ".part")
+    queue, tried, failures = _rank_sources(sources, record.get("size"), prefix), set(), []
+    while queue:
+        label, url, _ = queue.pop(0)
+        tried.add(url)
+        # Only an untried source that probed clearly faster can pull a download away.
+        faster = [speed for _, other, speed in queue if other not in tried and speed]
+        switch_below = SLOW_FRACTION * max(faster) if faster else 0.0
+        done = partial.stat().st_size if partial.exists() else 0
+        _status(f"{prefix}: {'resuming at ' + _human_bytes(done) if done else 'downloading'} "
+                f"from {_host(url)} ({label})")
         try:
-            with urlopen(request) as response:
-                total = int(response.headers.get("Content-Length") or 0)
-                _copy_with_progress(response, temporary, destination.name, total)
-            os.replace(temporary_path, destination)
-        except Exception:
-            temporary_path.unlink(missing_ok=True)
-            raise
+            _stream(url, partial, f"{destination.name} <- {_host(url)}", record.get("size", 0),
+                    switch_below)
+        except _Slow as slow:
+            _status(f"{prefix}: {_host(url)} slowed to {slow}; switching to a faster source")
+            queue.append((label, url, None))
+            continue
+        except (OSError, ValueError, HTTPException) as error:
+            failures.append(f"{_host(url)}: {error}")
+            _status(f"{prefix}: {_host(url)} failed ({error}); trying the next source")
+            continue
+        if _verified(partial, md5, record):
+            os.replace(partial, destination)
+            return label
+        failures.append(f"{_host(url)}: checksum mismatch")
+        _status(f"{prefix}: {_host(url)} delivered a file with the wrong checksum; discarding it")
+        partial.unlink(missing_ok=True)
+    raise CatalogError(f"No source delivered {destination.name}: {'; '.join(failures)}")
 
 
 def _safe_extract(archive: Path, destination: Path) -> None:
@@ -429,11 +601,18 @@ def fetch_dataset(name: str, version: str | None = None, profile: str = "balance
     catalog, recipe = dataset_recipe(name, version)
     target = dataset_directory(root, name, recipe["version"])
     target.mkdir(parents=True, exist_ok=True)
-    mirror, mirror_error = {}, None
+    mirror, records, registry_base, mirror_error = {}, {}, None, None
     try:
-        mirror = _mirror_files(Path(root), name, recipe)
+        settings = registry_status()
+        web = _registry_web_base(settings["registry"]) if settings["configured"] else None
+        if web:
+            records = _registry_manifest(web, settings["ref"], name, recipe)
+            registry_base = f"{web}/media/tag/{quote(settings['ref'])}"
+        else:
+            mirror = _mirror_files(Path(root), name, recipe)
     except RegistryUnavailable as error:
         mirror_error = str(error)
+    mirrors = dataset_mirrors()
     _status(f"[fetch] {name} {recipe['version']} (profile {profile}) -> {target}")
     if mirror_error:
         _status(f"  private registry unavailable ({mirror_error}); using canonical upstream")
@@ -448,9 +627,13 @@ def fetch_dataset(name: str, version: str | None = None, profile: str = "balance
                 shutil.copy2(mirror[artifact["id"]], destination)
                 source = "private_registry"
             else:
-                _status(f"{prefix}: downloading from {urlsplit(artifact['url']).netloc}")
-                _download(artifact["url"], destination)
-                source = "upstream"
+                record = records.get(artifact["id"], {})
+                relative = quote(record.get("path") or
+                                 f"datasets/{name}/{recipe['version']}/archives/{artifact['filename']}")
+                sources = [("private_registry", f"{registry_base}/{relative}")] if record else []
+                sources += [("mirror", f"{base}/{relative}") for base in mirrors]
+                sources.append(("upstream", artifact["url"]))
+                source = _fetch_from_sources(sources, destination, artifact["md5"], record, prefix)
         else:
             _status(f"{prefix}: already present")
             source = "local"

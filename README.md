@@ -22,8 +22,10 @@ The initial workspace contained no application, dataset, or teacher checkpoint. 
 
 The built-in catalog covers 13 compact vision benchmarks, from CIFAR and SVHN through MedMNIST,
 Caltech-101, EuroSAT, and STL-10, with balanced and deterministic IF10/50/100 profiles. Raw archives
-can come from their canonical upstream locations or an optional private Git LFS cache; the public
-source repository never requires private credentials.
+can come from their canonical upstream locations, an optional private Git LFS cache, or extra
+mirrors; each archive is downloaded from whichever source is fastest, switches source mid-download
+if one slows, and is accepted only if its checksum matches. The public source repository never
+requires private credentials.
 
 ```bash
 python -m kd dataset list

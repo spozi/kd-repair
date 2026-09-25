@@ -1,5 +1,7 @@
+from contextlib import contextmanager
 import hashlib
 import gzip
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -7,6 +9,8 @@ import stat
 import struct
 import tarfile
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -19,9 +23,9 @@ from kd.config import DataConfig, ExperimentConfig, TrainConfig
 from kd.data import build_data
 from kd.dataset_registry import (CatalogError, _loader_smoke_check,
                                  _materialize_dataset_layout, configure_registry,
-                                 create_mirror_manifest, fetch_dataset, initialize_registry,
-                                 load_catalog, registry_status, sha256_value,
-                                 validate_registry, verify_dataset)
+                                 create_mirror_manifest, dataset_mirrors, fetch_dataset,
+                                 initialize_registry, load_catalog, registry_status,
+                                 sha256_value, validate_registry, verify_dataset)
 
 
 # Dataset preparation reports progress on stderr; unittest discovery may import this
@@ -459,6 +463,172 @@ class CatalogDataTests(unittest.TestCase):
                                 TrainConfig())
         self.assertEqual(len(bundle.test.dataset), 20)
         self.assertEqual(bundle.provenance["test_per_class"], [2] * 10)
+
+
+class _Archives(BaseHTTPRequestHandler):
+    """Serve in-memory files with byte ranges; a path may slow down past a byte offset."""
+
+    def do_GET(self):
+        server = self.server
+        server.requests.append((self.path, self.headers.get("Range")))
+        body = server.files.get(self.path)
+        if body is None:
+            self.send_error(404)
+            return
+        start = 0
+        if self.headers.get("Range"):
+            start = int(self.headers["Range"].split("=")[1].split("-")[0])
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{len(body) - 1}/{len(body)}")
+        else:
+            self.send_response(200)
+        self.send_header("Content-Length", str(len(body) - start))
+        self.end_headers()
+        delay, after = server.throttle.get(self.path, (0.0, 0))
+        for offset in range(start, len(body), 64 * 1024):
+            try:
+                self.wfile.write(body[offset:offset + 64 * 1024])
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            if delay and offset >= after:
+                time.sleep(delay)
+
+    def log_message(self, *args):
+        pass
+
+
+@contextmanager
+def _serve(files: dict, throttle: dict | None = None):
+    """Yield (server, base URL); throttle maps a path to (seconds per 64 KiB, from byte)."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Archives)
+    server.files, server.throttle, server.requests = files, throttle or {}, []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+class SourceSelectionTests(unittest.TestCase):
+    """Archives come from the fastest source holding identical bytes, with resumable switches."""
+
+    PAYLOAD = bytes(range(256)) * 8 * 1024  # 2 MiB
+    ARCHIVE = "/mirror/datasets/toy/1/archives/payload.bin"
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        # No registry and no persisted settings: only mirrors and upstream take part.
+        environment = patch.dict(os.environ, {
+            "KD_DATASET_REGISTRY": "", "KD_DATASET_MIRRORS": "",
+            "KD_DATASET_REGISTRY_CONFIG": str(self.root / "absent.json")})
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name, value in {"PROBE_BYTES": 128 * 1024, "PROBE_SECONDS": 2.0,
+                            "PROBE_MIN_BYTES": 0, "SLOW_WINDOW": 0.3}.items():
+            patcher = patch(f"kd.dataset_registry.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _fetch(self, upstream: str, mirrors: str = "", catalog_payload: bytes | None = None) -> dict:
+        catalog = _catalog(catalog_payload or self.PAYLOAD, upstream)
+        path = self.root / "catalog.json"
+        path.write_text(json.dumps(catalog))
+        with patch("kd.dataset_registry.CATALOG_PATH", path), \
+                patch.dict(os.environ, {"KD_DATASET_MIRRORS": mirrors}):
+            return fetch_dataset("toy", root=self.root / "data")
+
+    def _fetched(self) -> bytes:
+        return (self.root / "data/toy/1/payload.bin").read_bytes()
+
+    def test_the_fastest_source_wins_the_speed_test(self):
+        files = {"/upstream.bin": self.PAYLOAD, self.ARCHIVE: self.PAYLOAD}
+        # The mirror is preferred by default, so only the speed test can put upstream first.
+        with _serve(files, {self.ARCHIVE: (0.1, 0)}) as (server, base):
+            result = self._fetch(f"{base}/upstream.bin", f"{base}/mirror")
+        self.assertEqual(result["artifacts"][0]["source"], "upstream")
+        self.assertEqual(self._fetched(), self.PAYLOAD)
+        # The mirror was only probed, never downloaded in full.
+        mirror = [header for path, header in server.requests if path == self.ARCHIVE]
+        self.assertEqual(mirror, [f"bytes=0-{128 * 1024 - 1}"])
+
+    def test_a_source_that_slows_down_hands_over_at_the_same_byte(self):
+        files = {"/upstream.bin": self.PAYLOAD, self.ARCHIVE: self.PAYLOAD}
+        # The mirror probes fastest, then slows to about 320 KiB/s after 256 KiB.
+        throttle = {self.ARCHIVE: (0.2, 256 * 1024), "/upstream.bin": (0.02, 0)}
+        with _serve(files, throttle) as (server, base):
+            result = self._fetch(f"{base}/upstream.bin", f"{base}/mirror")
+        self.assertEqual(result["artifacts"][0]["source"], "upstream")
+        self.assertEqual(self._fetched(), self.PAYLOAD)
+        resumed = [int(header.split("=")[1].split("-")[0]) for path, header in server.requests
+                   if path == "/upstream.bin" and header and not header.startswith("bytes=0-")]
+        self.assertEqual(len(resumed), 1)
+        self.assertGreaterEqual(resumed[0], 256 * 1024)
+
+    def test_a_mirror_with_the_wrong_bytes_is_discarded(self):
+        corrupt = bytes(reversed(self.PAYLOAD))
+        files = {"/upstream.bin": self.PAYLOAD, self.ARCHIVE: corrupt}
+        # Without a speed test the mirror is tried first, in preference order.
+        with patch("kd.dataset_registry.PROBE_MIN_BYTES", 1 << 40), \
+                _serve(files) as (_, base):
+            result = self._fetch(f"{base}/upstream.bin", f"{base}/mirror")
+        self.assertEqual(result["artifacts"][0]["source"], "upstream")
+        self.assertEqual(self._fetched(), self.PAYLOAD)
+
+    def test_an_interrupted_download_resumes_from_its_partial_file(self):
+        partial = self.root / "data/toy/1/payload.bin.part"
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(self.PAYLOAD[:1000])
+        with _serve({"/upstream.bin": self.PAYLOAD}) as (server, base):
+            self._fetch(f"{base}/upstream.bin")
+        self.assertEqual(server.requests, [("/upstream.bin", "bytes=1000-")])
+        self.assertEqual(self._fetched(), self.PAYLOAD)
+        self.assertFalse(partial.exists())
+
+    def test_an_http_registry_is_read_without_git(self):
+        catalog = _catalog(self.PAYLOAD, "http://127.0.0.1:9/unreachable.bin")
+        manifest = {"schema_version": 1, "dataset": "toy", "version": "1",
+                    "recipe_sha256": sha256_value(catalog["datasets"]["toy"]),
+                    "artifacts": {"raw": {"path": "datasets/toy/1/archives/payload.bin",
+                                          "size": len(self.PAYLOAD),
+                                          "sha256": _digest(self.PAYLOAD, "sha256")}}}
+        files = {"/owner/repo/raw/tag/catalog-v9.9.9/manifests/toy/1.json": json.dumps(manifest).encode(),
+                 "/owner/repo/media/tag/catalog-v9.9.9/datasets/toy/1/archives/payload.bin": self.PAYLOAD}
+        with _serve(files) as (_, base):
+            path = self.root / "catalog.json"
+            path.write_text(json.dumps(catalog))
+            registry = {"KD_DATASET_REGISTRY": f"{base}/owner/repo.git",
+                        "KD_DATASET_REGISTRY_REF": "catalog-v9.9.9"}
+            with patch("kd.dataset_registry.CATALOG_PATH", path), patch.dict(os.environ, registry):
+                result = fetch_dataset("toy", root=self.root / "data")
+        self.assertEqual(result["artifacts"][0]["source"], "private_registry")
+        self.assertNotIn("mirror_fallback", result)
+        self.assertFalse((self.root / "data/.registry").exists())
+
+    def test_no_source_with_the_right_bytes_is_an_error(self):
+        with _serve({"/upstream.bin": b"wrong"}) as (_, base), \
+                self.assertRaisesRegex(CatalogError, "No source delivered"):
+            self._fetch(f"{base}/upstream.bin")
+
+    def test_mirrors_persist_across_registry_updates_and_the_environment_overrides_them(self):
+        path = self.root / "datasets.json"
+        registry = "https://example.test/owner/repo.git"
+        configure_registry(registry, path=path, mirrors=["https://mirror.test/kd/"])
+        # A launcher re-running registry-config without mirrors must not erase them.
+        configured = configure_registry(registry, path=path)
+        self.assertEqual(configured["mirrors"], ["https://mirror.test/kd"])
+        with patch.dict(os.environ, {"KD_DATASET_MIRRORS": "https://a.test, https://b.test"}):
+            self.assertEqual(dataset_mirrors(path), ["https://a.test", "https://b.test"])
+        with patch.dict(os.environ, {"KD_DATASET_REGISTRY": ""}):
+            os.environ.pop("KD_DATASET_MIRRORS")
+            self.assertEqual(registry_status(path)["mirrors"], ["https://mirror.test/kd"])
+        self.assertEqual(configure_registry(registry, path=path, mirrors=[])["mirrors"], [])
+        with self.assertRaisesRegex(CatalogError, "credentials"):
+            configure_registry(registry, path=path, mirrors=["https://user:secret@mirror.test"])
 
 
 if __name__ == "__main__":

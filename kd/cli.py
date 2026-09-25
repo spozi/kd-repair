@@ -169,6 +169,12 @@ def main(argv=None) -> None:
     registry_config.add_argument("--ref", default="catalog-v1.2.0")
     registry_config.add_argument("--path", help="Override the per-user configuration path")
     registry_config.add_argument("--remove", action="store_true")
+    registry_config.add_argument(
+        "--mirror", action="append", dest="mirrors", metavar="URL",
+        help="Base URL serving the registry tree (datasets/NAME/VERSION/archives/FILE); "
+             "repeat for several. Omit to keep the mirrors already configured")
+    registry_config.add_argument("--clear-mirrors", action="store_true",
+                                 help="Remove every configured mirror")
     registry_status_command = dataset_commands.add_parser(
         "registry-status", help="Show the effective private registry configuration")
     registry_status_command.add_argument("--path", help="Override the per-user configuration path")
@@ -200,7 +206,8 @@ def main(argv=None) -> None:
                 report = initialize_registry(args.path)
             elif args.dataset_command == "registry-config":
                 report = configure_registry(args.url, args.ref, path=args.path,
-                                            remove=args.remove)
+                                            remove=args.remove,
+                                            mirrors=[] if args.clear_mirrors else args.mirrors)
             elif args.dataset_command == "registry-status":
                 report = registry_status(args.path)
             elif args.dataset_command == "mirror-manifest":
