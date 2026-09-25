@@ -11,8 +11,10 @@ if [[ -n "${PYTHON_BIN+x}" ]]; then
 fi
 PYTHON_BIN="${PYTHON_BIN:-python}"
 CONDA_ENV="${CONDA_ENV:-kd}"
-PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
-PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu132}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
+# Empty keeps the pinned build in requirements-cuda.txt; a URL swaps in that index's torch.
+PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-}"
+REQUIREMENTS_FILE="${REPO_ROOT}/requirements-cuda.txt"
 DATA_ROOT="${DATA_ROOT:-data}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-runs/experiment1-all-datasets}"
 REGISTRY_URL="${KD_DATASET_REGISTRY:-https://gitea.izzus.dev/syafiq/kd-repair.git}"
@@ -56,7 +58,8 @@ Options:
   --profiles NAMES      Comma-separated profile subset
   --python PATH         Python interpreter; skips automatic provisioning
   --conda-env NAME      Conda environment to provision when no venv is active (default: kd)
-  --pytorch-index URL   PyTorch CUDA wheel index (default: cu132)
+  --pytorch-index URL   Replace the pinned torch 2.14.0+cu132 with the same release
+                        from another CUDA wheel index (e.g. .../whl/cu130)
   --skip-bootstrap      Use the current/default Python without provisioning anything
   --force-bootstrap     Reinstall dependencies even when they are already importable
   --data-root PATH      Dataset directory (default: data)
@@ -73,9 +76,10 @@ Options:
   -h, --help            Show this help
 
 Environment provisioning is automatic: an activated virtualenv is used as-is, a
-Conda environment is created when Conda is available, and otherwise a local
-.venv is created. Dependencies install only when missing; pass --force-bootstrap
-to reinstall.
+Conda environment matching environment.yml is created when Conda is available,
+and otherwise a local .venv is created. Every path installs the pins in
+requirements-cuda.txt. Dependencies install only when missing or off-pin; pass
+--force-bootstrap to reinstall.
 
 Default matrix: all 13 catalog datasets, each with balanced, IF10, IF50, and
 IF100 profiles (52 studies). The queue keeps one worker busy per GPU and
@@ -212,14 +216,28 @@ PY
 }
 
 python_has_requirements() {
-  "$1" - <<'PY' >/dev/null 2>&1 || return 1
-import importlib.util
+  REQUIREMENTS_FILE="$REQUIREMENTS_FILE" PYTORCH_INDEX_URL="$PYTORCH_INDEX_URL" \
+    "$1" - <<'PY' >/dev/null 2>&1 || return 1
+import os
 import sys
+from importlib.metadata import PackageNotFoundError, version
 
 if sys.version_info < (3, 11):
     raise SystemExit(1)
-for module in ("torch", "torchvision", "numpy", "PIL", "scipy", "matplotlib"):
-    if importlib.util.find_spec(module) is None:
+# Importable is not enough either: every installed version must equal its pin. With a
+# replacement wheel index the torch build tag (+cuXXX) legitimately differs.
+relaxed = {"torch", "torchvision"} if os.environ["PYTORCH_INDEX_URL"] else set()
+for line in open(os.environ["REQUIREMENTS_FILE"]):
+    name, sep, pinned = line.split("#")[0].strip().partition("==")
+    if not sep:
+        continue
+    try:
+        installed = version(name)
+    except PackageNotFoundError:
+        raise SystemExit(1)
+    if name in relaxed:
+        installed, pinned = installed.split("+")[0], pinned.split("+")[0]
+    if installed != pinned:
         raise SystemExit(1)
 PY
   # Being importable is not enough: the wheel must carry kernels for this machine's GPUs.
@@ -235,25 +253,41 @@ ensure_requirements() {
   progress="$(pip_progress_flag)"
   log_stage "Installing dependencies into ${interpreter}"
   "$interpreter" -m pip install --upgrade pip
-  if ((FORCE_BOOTSTRAP)) || ! torch_supports_local_gpu "$interpreter"; then
-    if "$interpreter" -c 'import torch' >/dev/null 2>&1; then
-      printf 'The installed PyTorch has no kernels for this GPU; reinstalling.\n'
-      report_gpu_mismatch "$interpreter"
-    fi
-    printf 'Installing PyTorch from %s (multi-GB download; progress follows)\n' "$PYTORCH_INDEX_URL"
-    # --force-reinstall: pip would otherwise treat a wrong-architecture build as satisfying.
-    "$interpreter" -m pip install --progress-bar "$progress" --force-reinstall \
-      torch torchvision --index-url "$PYTORCH_INDEX_URL"
+  if "$interpreter" -c 'import torch' >/dev/null 2>&1 && ! torch_supports_local_gpu "$interpreter"; then
+    printf 'The installed PyTorch has no kernels for this GPU; reinstalling.\n'
+    report_gpu_mismatch "$interpreter"
+  fi
+  printf 'Installing %s (PyTorch is a multi-GB download; progress follows)\n' "$REQUIREMENTS_FILE"
+  local reinstall=()
+  if ((FORCE_BOOTSTRAP)); then
+    reinstall=(--force-reinstall)
+  fi
+  "$interpreter" -m pip install --progress-bar "$progress" "${reinstall[@]}" -r "$REQUIREMENTS_FILE"
+  if [[ -n "$PYTORCH_INDEX_URL" ]]; then
+    local torch_version torchvision_version
+    torch_version="$(sed -n 's/^torch==\([^+]*\).*/\1/p' "$REQUIREMENTS_FILE")"
+    torchvision_version="$(sed -n 's/^torchvision==\([^+]*\).*/\1/p' "$REQUIREMENTS_FILE")"
+    printf 'Replacing PyTorch with the %s build from %s\n' "$torch_version" "$PYTORCH_INDEX_URL"
+    # --force-reinstall: pip would otherwise treat the pinned build as satisfying the request.
+    "$interpreter" -m pip install --progress-bar "$progress" --force-reinstall --no-deps \
+      "torch==${torch_version}" "torchvision==${torchvision_version}" --index-url "$PYTORCH_INDEX_URL"
   fi
   "$interpreter" -m pip install --progress-bar "$progress" -e "${REPO_ROOT}[reports]"
+  if ! torch_supports_local_gpu "$interpreter"; then
+    printf '%s\n' 'The installed PyTorch still has no kernels for this GPU:' >&2
+    report_gpu_mismatch "$interpreter" >&2
+    printf '%s\n' 'Pass --pytorch-index with a CUDA wheel index that supports it.' >&2
+    exit 1
+  fi
 }
 
 bootstrap_conda() {
   log_stage "Provisioning Conda environment ${CONDA_ENV}"
   if ! conda run -n "$CONDA_ENV" python -c 'import sys' >/dev/null 2>&1; then
     printf 'Creating Conda environment %s with python %s\n' "$CONDA_ENV" "$PYTHON_VERSION"
-    # --no-capture-output streams solver and download progress instead of buffering it.
-    conda create -n "$CONDA_ENV" "python=$PYTHON_VERSION" -y
+    # Mirrors environment.yml's Conda layer. Its pip layer follows in ensure_requirements,
+    # where pip progress streams live and a wrong-architecture wheel is caught.
+    conda create -n "$CONDA_ENV" "python=$PYTHON_VERSION" pip git-lfs -c conda-forge -y
   fi
   local resolved
   resolved="$(conda run -n "$CONDA_ENV" --no-capture-output \

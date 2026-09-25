@@ -1,0 +1,12 @@
+# GPU-server environment: conda env create -f environment.yml && conda activate kd
+# Package pins live in requirements-cuda.txt so Conda and plain-venv installs stay identical.
+name: kd
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - git-lfs
+  - pip:
+      - -r requirements-cuda.txt
+      - -e .[reports]
