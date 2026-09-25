@@ -54,6 +54,9 @@ The preflight performs pinned-memory transfer, channels-last convolution, autoca
 optimizer update. It reports the selected precision, GPU model, compute capability, cuDNN version,
 throughput, and peak allocated memory.
 
+Compact 32×32 runs are usually limited by the CPU, not the GPU: see the
+[GPU data pipeline proposal](gpu-data-pipeline.md) for measurements and a planned fix.
+
 ## Runtime policy
 
 The `train` section accepts these accelerator controls:
