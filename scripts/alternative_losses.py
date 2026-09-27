@@ -29,6 +29,7 @@ run names and loader settings.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import statistics
 import sys
@@ -186,6 +187,16 @@ def _score(checkpoint_dir: Path, name: str, seed: int, evaluation, cell: Cell, o
             "response_weight": config.distillation.weight, "method": config.distillation.method}
 
 
+def _merge_report(path: Path, job: str, entry: dict) -> None:
+    """Add one cell's scores under a lock, so runs on other cells of the pairing can share the file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_suffix(".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        report = _read(path) if path.is_file() else {}
+        report[job] = {**report.get(job, {}), **_json(entry)}
+        write_json(path, report)
+
+
 def run(args) -> None:
     teachers = args.teachers.resolve() if args.teachers else None
     students = args.students.resolve() if args.students else None
@@ -220,7 +231,6 @@ def run(args) -> None:
           flush=True)
     if args.dry_run:
         return
-    report = _read(output / "report.json") if (output / "report.json").is_file() else {}
     for cell in pairing_cells:
         trained = {(v, s): _train(cell, s, v, weights, output, args.device, data_root, args.workers)
                    for s in args.seeds for v in args.variants}
@@ -234,13 +244,13 @@ def run(args) -> None:
         reference = cell.reference_data(args.seeds[0])
         if reference is not None and _json(evaluation.provenance) != reference:
             raise ValueError(f"{cell.job}: evaluation data differs from the split the study was scored on")
-        entry = report.setdefault(cell.job, {"repair": "selected" if cell.repaired else "none"})
+        entry = {"repair": "selected" if cell.repaired else "none"}
         entry["kd"] = {seed: _score(cell.control(seed), f"kd_control_seed{seed}", seed, evaluation, cell, output)
                        for seed in args.seeds}
         for variant in args.variants:
             entry[variant] = {seed: _score(trained[(variant, seed)], f"{variant}_{cell.job}_seed{seed}", seed,
                                            evaluation, cell, output) for seed in args.seeds}
-        write_json(output / "report.json", report)
+        _merge_report(output / "report.json", cell.job, entry)
 
 
 def main() -> None:
