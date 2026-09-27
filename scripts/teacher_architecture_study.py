@@ -107,8 +107,12 @@ def main() -> None:
         root = args.output / name
         study = root / "studies" / "confirmatory"
         print(f"[job] {name}", flush=True)
+        base_device = args.device
+        if scaled and (baselines / "protocol.json").is_file():
+            # The baseline protocol records the GPU it trained on; confirming it must name the same one.
+            base_device = json.loads((baselines / "protocol.json").read_text())["configs"][0]["train"]["device"]
         steps = [[sys.executable, "-m", "kd", "neuron-surgery-baselines", "--study-config", str(base_config),
-                  "--output", str(baselines), "--root", args.data_root, "--device", args.device],
+                  "--output", str(baselines), "--root", args.data_root, "--device", base_device],
                  [sys.executable, "-m", "kd", "neuron-surgery-study", "--study-config", str(config),
                   "--baseline", str(baselines), "--output", str(study), "--device", args.device]]
         if scaled:
