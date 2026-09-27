@@ -12,7 +12,13 @@ The lower response weight is fixed per pairing from training-loss histories only
 test results: weight = (KD control's median teacher-term/cross-entropy ratio) / (the same ratio
 for the published-setting run), medians over epochs after warm-up and over every cell and seed.
 Run the published variants first, print the weights with --suggest-weights, then run the
-lower-response variants with --matched-weights.
+lower-response variants with --matched-weights. CNN-T -> CNN-S keeps the weights already fixed
+for it (dkd=0.15, rld=0.2), so its earlier runs stay valid.
+
+--link-existing reuses finished CNN-T -> CNN-S runs of the same recipe (the distillation
+baselines under the matrix and runs/matched-balance) by linking them into the output, after
+checking that each one's config equals the config this script would train, apart from paths,
+run names and loader settings.
 
     python scripts/alternative_losses.py --pairing r18-cnn --variants loca dkd rld --device cuda:0
     python scripts/alternative_losses.py --pairing r18-cnn --suggest-weights
@@ -23,9 +29,10 @@ lower-response variants with --matched-weights.
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -41,6 +48,10 @@ from pairing_cells import PAIRINGS, Cell, cells  # noqa: E402
 
 VARIANTS = ("loca", "dkd", "rld", "dkd_matched", "rld_matched")
 WARMUP = 5  # epochs excluded when measuring the loss balance, as in the distillation warm-up
+# Settings that locate a run or feed its loader, not part of what is trained.
+EXECUTION = {("name",), ("output_dir",), ("data", "root"), ("teacher", "checkpoint"), ("train", "device"),
+             ("train", "workers"), ("train", "threads"), ("train", "persistent_workers"),
+             ("train", "prefetch_factor")}
 
 
 def _spec(variant: str, control, weights: dict) -> tuple[str, float, float]:
@@ -81,17 +92,70 @@ def suggest_weights(pairing_cells: list[Cell], output: Path, seeds: list[int]) -
             **{m: round(reference / statistics.median(v), 3) for m, v in published.items()}}
 
 
-def _train(cell: Cell, seed: int, variant: str, weights: dict, output: Path, device: str,
-           data_root: str, workers: int | None) -> Path:
-    control_dir = cell.control(seed)
-    control = from_dict(_read(control_dir / "config.json"))
+def _config(cell: Cell, seed: int, variant: str, weights: dict, output: Path, device: str = "cpu",
+            data_root: str = "data", workers: int | None = None):
+    control = from_dict(_read(cell.control(seed) / "config.json"))
     method, weight, beta = _spec(variant, control, weights)
-    config = replace(
+    return replace(
         control, name=f"{variant}_{cell.job}_seed{seed}", output_dir=str(output / cell.job),
         teacher=replace(control.teacher, checkpoint=str(cell.teacher)),
         data=replace(control.data, root=data_root),
         train=replace(control.train, device=device, **({} if workers is None else {"workers": workers})),
         distillation=replace(control.distillation, method=method, weight=weight, beta=beta))
+
+
+def _recipe(config) -> dict:
+    recipe = asdict(config)
+    for path in EXECUTION:
+        section = recipe
+        for key in path[:-1]:
+            section = section[key]
+        section.pop(path[-1])
+    return recipe
+
+
+def _existing(cell: Cell, seed: int, variant: str, weights: dict, matrix: Path, matched: Path) -> Path | None:
+    """A finished CNN-T -> CNN-S run of this variant from the earlier studies, if there is one."""
+    method = variant.removesuffix("_matched")
+    if variant == method:
+        path = cell.root / "baselines" / "distillation" / method / f"{method}_{cell.job}_seed{seed}"
+        return path if (path / "summary.json").is_file() else None
+    found = sorted(matched.glob(f"*/{cell.job}/{method}_w{weights[method]:g}_{cell.job}_seed{seed}"))
+    found = [path for path in found if (path / "summary.json").is_file()]
+    if len(found) > 1:
+        raise ValueError(f"Several finished {variant} runs for {cell.job} seed {seed}: {found}")
+    return found[0] if found else None
+
+
+def link_existing(pairing_cells: list[Cell], variants, seeds, weights: dict, output: Path,
+                  matrix: Path, matched: Path, dry_run: bool = False) -> int:
+    """Link finished runs whose recipe equals this script's; returns how many were (or would be) linked."""
+    linked = 0
+    for cell in pairing_cells:
+        for seed in seeds:
+            for variant in variants:
+                target = output / cell.job / f"{variant}_{cell.job}_seed{seed}"
+                if target.is_symlink() or target.exists():
+                    continue
+                source = _existing(cell, seed, variant, weights, matrix, matched)
+                if source is None:
+                    continue
+                expected = _recipe(_config(cell, seed, variant, weights, output))
+                if _recipe(from_dict(_read(source / "config.json"))) != expected:
+                    raise ValueError(f"{source} was trained with a different recipe than {variant}")
+                linked += 1
+                if dry_run:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(os.path.relpath(source.resolve(), target.parent.resolve()),
+                                  target_is_directory=True)
+    return linked
+
+
+def _train(cell: Cell, seed: int, variant: str, weights: dict, output: Path, device: str,
+           data_root: str, workers: int | None) -> Path:
+    control_dir = cell.control(seed)
+    config = _config(cell, seed, variant, weights, output, device, data_root, workers)
     directory = output / cell.job / config.name
     if not (directory / "summary.json").is_file():
         last = directory / "last.pt"
@@ -110,7 +174,8 @@ def _score(checkpoint_dir: Path, name: str, seed: int, evaluation, cell: Cell, o
     config = from_dict(_read(checkpoint_dir / "config.json"))
     checkpoint = checkpoint_dir / "student.pt"
     model, _ = _model(config, checkpoint, evaluation.classes)
-    directory = output / cell.job / name / "evaluation"
+    # Outside the run folder, which may be a link into an earlier study's results.
+    directory = output / cell.job / "evaluation" / name
     identity = {"checkpoint_sha256": fingerprint(checkpoint), "seed": seed, "condition": name,
                 "evaluation_split": cell.spec["evaluation_split"], "data": evaluation.provenance}
     split = getattr(evaluation, cell.spec["evaluation_split"])
@@ -133,7 +198,14 @@ def run(args) -> None:
     weights = dict(pair.split("=") for pair in args.matched_weights)
     weights = {k: float(v) for k, v in weights.items()}
     data_root = str(Path(args.data_root).resolve())
-    planned = {"cells": len(pairing_cells), "to_train": 0}
+    linked = 0
+    if args.link_existing:
+        if args.pairing != "cnn-cnn":
+            raise SystemExit("--link-existing applies to cnn-cnn, whose earlier runs share its controls")
+        linked = link_existing(pairing_cells, args.variants, args.seeds, weights, output,
+                               args.matrix.resolve(), args.matched_root.resolve(), dry_run=args.dry_run)
+        print(f"[link] {linked} finished runs {'would be ' if args.dry_run else ''}reused", flush=True)
+    planned = {"cells": len(pairing_cells), "to_train": -linked if args.dry_run else 0}
     for cell in pairing_cells:
         for seed in args.seeds:
             control = cell.control(seed)
@@ -185,6 +257,10 @@ def main() -> None:
                         help="Lower response weights, e.g. dkd=0.15 rld=0.2")
     parser.add_argument("--suggest-weights", action="store_true",
                         help="Print the lower response weights from training histories and exit")
+    parser.add_argument("--link-existing", action="store_true",
+                        help="cnn-cnn: reuse finished runs of the same recipe from the earlier studies")
+    parser.add_argument("--matched-root", type=Path, default=Path("runs/matched-balance"),
+                        help="Where the earlier lower-response DKD/RLD runs live (with --link-existing)")
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--data-root", default="data")

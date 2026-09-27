@@ -32,6 +32,20 @@ def _read(path: Path):
     return json.loads(path.read_text())
 
 
+def _exported(study: Path, selected_sha: str) -> Path | None:
+    """The study's own export of the selected repair, used when the candidate file is absent."""
+    record = study / "teacher_repaired.json"
+    if not record.is_file() or _read(record)["source_sha256"] != selected_sha:
+        return None
+    return study / "teacher_repaired.pt"
+
+
+def _expected_sha(repaired: Path, selected: dict) -> str:
+    if repaired.name == "teacher_repaired.pt":
+        return _read(repaired.with_suffix(".json"))["sha256"]
+    return selected["checkpoint_sha256"]
+
+
 @dataclass
 class Cell:
     pairing: str
@@ -94,9 +108,11 @@ def cells(pairing: str, matrix: Path, *, teachers: Path | None = None, students:
             selected = comparison["teacher_selection"]["selected"]
             repaired = (root / "studies" / "confirmatory" / "repair_candidates"
                         / f"budget{selected['budget']}_lr{selected['learning_rate']}" / "teacher.pt")
-            if verify_repaired and (not repaired.is_file()
-                                    or fingerprint(repaired) != selected["checkpoint_sha256"]):
-                raise ValueError(f"Selected repaired teacher missing or changed: {repaired}")
+            if not repaired.is_file():
+                repaired = _exported(root / "studies" / "confirmatory", selected["checkpoint_sha256"])
+            if verify_repaired and (repaired is None or not repaired.is_file()
+                                    or fingerprint(repaired) != _expected_sha(repaired, selected)):
+                raise ValueError(f"Selected repaired teacher missing or changed in {root}")
         student_root = None
         if student_model != "cifar_student" and teacher_model == "cifar_teacher":
             if students is None:
