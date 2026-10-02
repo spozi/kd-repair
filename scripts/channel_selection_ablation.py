@@ -1,15 +1,19 @@
-"""Phase 1 of the channel-selection ablation: repair controls, no students.
+"""The channel-selection ablation: repair control channel sets in place of screened ones.
 
 Tests whether causal screening is what helps, or whether any set of channels of the
 same size would do. For each setting that produced a repair, the study runs again with
 ``channel_selection`` set to each control mode, holding the budget, learning rate and
 guardrails at the values the original run selected.
 
-Nothing is distilled here: ``downstream_kd=False`` stops after the repaired teacher, so
-the claim is tested on the teacher where it is made, at a fraction of the cost.
+Phase 1 (the default) stops after the repaired teacher: the claim is tested on the
+teacher where it is made, at a fraction of the cost. Phase 2 (``--downstream-kd``) also
+distils the students, into a separate output root because the protocol differs; run it
+only on the settings Phase 1 shows are worth confirming.
 
-    python3 scripts/channel_selection_ablation.py --plan      # what would run
-    python3 scripts/channel_selection_ablation.py --device mps
+    python3 scripts/channel_selection_ablation.py --plan
+    python3 scripts/channel_selection_ablation.py --only cifar10/lt-if50 --device mps
+    python3 scripts/channel_selection_ablation.py --device mps --keep-going
+    python3 scripts/channel_selection_ablation.py --downstream-kd --only svhn/lt-if10
 
 Settings whose validated pool is too small for a disjoint ``antiscreened`` set skip that
 arm, and the plan says so rather than running a control that restates the screened set.
@@ -73,17 +77,24 @@ def arm_jobs(settings: list[dict], arms: tuple[str, ...], draws: int,
     return jobs, skipped
 
 
-def run_job(job: dict, baseline_root: Path, device: str, dry_run: bool) -> dict:
+def selected(setting: dict, only: list[str]) -> bool:
+    """Match ``dataset`` or ``dataset/profile`` tokens; no tokens selects everything."""
+    name = f"{setting['dataset']}/{setting['profile']}"
+    return not only or any(token in (setting["dataset"], name) for token in only)
+
+
+def run_job(job: dict, baseline_root: Path, device: str, dry_run: bool,
+            downstream_kd: bool, data_root: Path) -> dict:
     spec = replace(matrix_spec(job["dataset"], job["profile"]),
                    channel_selection=job["arm"],
                    channel_selection_seed=job["selection_seed"],
                    channel_budgets=(job["budget"],),
                    learning_rates=(job["learning_rate"],),
-                   downstream_kd=False)
+                   downstream_kd=downstream_kd)
     baseline = baseline_root / job["dataset"] / job["profile"] / "baselines" / "confirmatory"
     return run_neuron_surgery_study(baseline=str(baseline), output=job["output"],
                                     device=device, seeds=spec.student_seeds,
-                                    dry_run=dry_run, spec=spec)
+                                    dry_run=dry_run, spec=spec, data_root=data_root)
 
 
 def main() -> int:
@@ -93,7 +104,15 @@ def main() -> int:
                         help="Finished Experiment 1 runs, for each setting's chosen budget")
     parser.add_argument("--baseline-root", type=Path,
                         help="Where the baseline teachers live (defaults to --source-root)")
-    parser.add_argument("--output-root", type=Path, default=Path("runs/channel-selection-ablation"))
+    parser.add_argument("--output-root", type=Path,
+                        help="Defaults to runs/channel-selection-ablation, or the -students "
+                             "variant with --downstream-kd")
+    parser.add_argument("--only", nargs="+", default=[], metavar="DATASET[/PROFILE]",
+                        help="Restrict to these settings, e.g. cifar10/lt-if50 or svhn")
+    parser.add_argument("--data-root", type=Path, default=Path("data"),
+                        help="Local dataset root; the saved configs record the training host's")
+    parser.add_argument("--downstream-kd", action="store_true",
+                        help="Phase 2: also distil the students from each repaired teacher")
     parser.add_argument("--arms", nargs="+", default=list(CHANNEL_SELECTIONS),
                         choices=list(CHANNEL_SELECTIONS))
     parser.add_argument("--draws", type=int, default=3,
@@ -107,9 +126,13 @@ def main() -> int:
                         help="Record failures and continue instead of stopping")
     args = parser.parse_args()
 
-    settings = finished_settings(args.source_root)
+    if args.output_root is None:
+        args.output_root = Path("runs/channel-selection-ablation"
+                                + ("-students" if args.downstream_kd else ""))
+    settings = [row for row in finished_settings(args.source_root) if selected(row, args.only)]
     if not settings:
-        print(f"No settings with a selected repair under {args.source_root}", file=sys.stderr)
+        print(f"No settings with a selected repair under {args.source_root}"
+              + (f" matching {' '.join(args.only)}" if args.only else ""), file=sys.stderr)
         return 1
     jobs, skipped = arm_jobs(settings, tuple(args.arms), args.draws, args.seed, args.output_root)
 
@@ -129,7 +152,8 @@ def main() -> int:
         label = f"{job['dataset']}/{job['profile']} {job['arm']} draw{job['draw']}"
         print(f"[{index}/{len(jobs)}] {label}", flush=True)
         try:
-            outcome = run_job(job, baseline_root, args.device, args.dry_run)
+            outcome = run_job(job, baseline_root, args.device, args.dry_run,
+                             args.downstream_kd, args.data_root)
             results.append({**job, "status": "ok", "result": outcome})
         except Exception as error:
             failures.append({**job, "status": "failed", "error": f"{type(error).__name__}: {error}"})
@@ -141,7 +165,8 @@ def main() -> int:
     args.output_root.mkdir(parents=True, exist_ok=True)
     write_json(args.output_root / "ablation_runs.json",
                {"seed": args.seed, "draws": args.draws, "arms": list(args.arms),
-                "device": args.device, "dry_run": args.dry_run, "skipped": skipped,
+                "device": args.device, "dry_run": args.dry_run,
+                "downstream_kd": args.downstream_kd, "only": args.only, "skipped": skipped,
                 "results": results, "failures": failures})
     print(f"\n{len(results)} ok, {len(failures)} failed -> "
           f"{args.output_root / 'ablation_runs.json'}")

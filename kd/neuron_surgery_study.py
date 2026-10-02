@@ -289,8 +289,15 @@ def _configured_stages(spec: NeuronSurgerySpec) -> tuple[str, ...]:
     raise ValueError("Study teacher must be cifar_teacher or a supported ResNet")
 
 
+def _with_data_root(config, data_root: str | Path | None):
+    """Point a saved run config at local data, since configs record the training host's path."""
+    if data_root is None:
+        return config
+    return replace(config, data=replace(config.data, root=str(Path(data_root).resolve())))
+
+
 def _load_inputs(baseline: str | Path, seeds: tuple[int, ...],
-                 spec: NeuronSurgerySpec):
+                 spec: NeuronSurgerySpec, data_root: str | Path | None = None):
     baseline = Path(baseline).resolve()
     spec.validate()
     if tuple(seeds) != spec.student_seeds:
@@ -300,7 +307,7 @@ def _load_inputs(baseline: str | Path, seeds: tuple[int, ...],
     teacher_checkpoint = teacher_directory / "student.pt"
     if not teacher_config_path.is_file() or not teacher_checkpoint.is_file():
         raise FileNotFoundError(f"Missing repair teacher config or checkpoint: {teacher_directory}")
-    teacher_config = from_dict(_read(teacher_config_path))
+    teacher_config = _with_data_root(from_dict(_read(teacher_config_path)), data_root)
     teacher_config.validate(require_teacher=False)
     factor = ({"lt-if10": 10.0, "lt-if50": 50.0, "lt-if100": 100.0}
               .get(teacher_config.data.dataset_profile, teacher_config.data.imbalance_factor))
@@ -329,7 +336,7 @@ def _load_inputs(baseline: str | Path, seeds: tuple[int, ...],
         summary_path = path / "summary.json"
         if not config_path.is_file() or not checkpoint.is_file() or not summary_path.is_file():
             raise FileNotFoundError(f"Missing matched KD baseline artifacts for seed {seed}")
-        config = from_dict(_read(config_path))
+        config = _with_data_root(from_dict(_read(config_path)), data_root)
         config.validate()
         recipe = (config.data, config.student.name, config.teacher.name,
                   config.distillation.method, config.distillation.temperature,
@@ -343,10 +350,16 @@ def _load_inputs(baseline: str | Path, seeds: tuple[int, ...],
         if (recipe != expected or config.student.checkpoint is not None
                 or config.name != run_name):
             raise ValueError(f"Seed {seed} baseline differs from the predeclared KD recipe")
-        if fingerprint(config.teacher.checkpoint) != teacher_sha256:
+        summary = _read(summary_path)
+        # Configs record the training host's path. Where it no longer exists, the hash
+        # the student recorded at training time identifies its teacher just as strictly.
+        source = Path(config.teacher.checkpoint)
+        trained_from = (fingerprint(source) if source.is_file()
+                        else (summary.get("teacher") or {}).get("checkpoint_sha256"))
+        if trained_from != teacher_sha256:
             raise ValueError("Student baseline teacher differs from the repair teacher")
         students[seed] = {"config": config, "checkpoint": checkpoint,
-                          "summary": _read(summary_path),
+                          "summary": summary,
                           "checkpoint_sha256": fingerprint(checkpoint)}
     return baseline, teacher_config, teacher_checkpoint, students
 
@@ -674,12 +687,18 @@ def _render_report(comparison: dict) -> str:
 def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
                              output="runs/cifar10-lt-neuron-surgery", device="auto",
                              seeds=DEFAULT_SEEDS, dry_run=False, *,
-                             spec: NeuronSurgerySpec | None = None):
-    """Localize/repair one teacher, then run three matched repaired-teacher KD arms."""
+                             spec: NeuronSurgerySpec | None = None,
+                             data_root: str | Path | None = None):
+    """Localize/repair one teacher, then run three matched repaired-teacher KD arms.
+
+    ``data_root`` replaces the dataset root recorded in the baseline configs, for reruns
+    on a host other than the one that trained them. The protocol records the root used.
+    """
     seeds = tuple(seeds)
     spec = NeuronSurgerySpec() if spec is None else spec
     spec.validate()
-    baseline, teacher_config, teacher_checkpoint, students = _load_inputs(baseline, seeds, spec)
+    baseline, teacher_config, teacher_checkpoint, students = _load_inputs(
+        baseline, seeds, spec, data_root)
     _data_available(teacher_config)
     directory = Path(output).resolve()
     protocol = _protocol(baseline, directory, device, teacher_config, teacher_checkpoint,
