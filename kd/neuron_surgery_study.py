@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
@@ -40,6 +41,8 @@ DEFAULT_SEEDS = (42, 43, 44)
 REPAIR_SEED = 2026
 CHANNEL_BUDGETS = (2, 4, 8)
 LEARNING_RATES = (0.001, 0.005)
+# Repair the screened channels, or a control set, to test whether screening is what helps.
+CHANNEL_SELECTIONS = ("screened", "random", "stage_matched_random", "antiscreened")
 EXPECTED_TRAIN_COUNTS = (4500, 2698, 1617, 969, 581, 348, 209, 125, 75, 45)
 EXPECTED_TARGET_COUNTS = (70, 42, 25, 15, 9)
 STATISTICS_SEED = 2026
@@ -90,6 +93,8 @@ class NeuronSurgerySpec:
     dataset_version: str | None = None
     dataset_profile: str | None = None
     allow_sparse_class_fallback: bool = False
+    channel_selection: str = "screened"
+    channel_selection_seed: int = 2026
 
     def validate(self) -> None:
         if not self.name or Path(self.name).name != self.name:
@@ -108,6 +113,8 @@ class NeuronSurgerySpec:
             raise ValueError("Study score_mode must be differential or gradient_only")
         if self.repair_subject not in {"teacher", "student"}:
             raise ValueError("Study repair_subject must be teacher or student")
+        if self.channel_selection not in CHANNEL_SELECTIONS:
+            raise ValueError(f"Study channel_selection must be one of {CHANNEL_SELECTIONS}")
         if not isinstance(self.causal_validation, bool) or not isinstance(self.downstream_kd, bool):
             raise ValueError("Study causal_validation and downstream_kd must be booleans")
         if not 0 < self.target_fraction <= 1 or self.companion_count < 1:
@@ -344,6 +351,42 @@ def _load_inputs(baseline: str | Path, seeds: tuple[int, ...],
     return baseline, teacher_config, teacher_checkpoint, students
 
 
+def select_channels(selection: str, ranking: list[dict], pool: list[dict], budget: int,
+                    seed: int) -> list[dict]:
+    """Choose which channels to repair under one selection mode.
+
+    ``ranking`` holds the channels that passed causal validation, best first; ``pool``
+    holds every scored channel. The control modes exist to test whether the screening
+    is what helps, or whether any set of this size would do.
+    """
+    if selection not in CHANNEL_SELECTIONS:
+        raise ValueError(f"Unknown channel_selection: {selection}")
+    if budget < 1 or len(ranking) < budget:
+        raise ValueError(f"Budget {budget} exceeds the {len(ranking)} validated channels")
+    if selection == "screened":
+        return list(ranking[:budget])
+    if selection == "antiscreened":
+        if len(ranking) < 2 * budget:
+            raise ValueError("Antiscreened selection needs twice the budget in validated "
+                             f"channels; {len(ranking)} available for budget {budget}")
+        return list(ranking[-budget:])
+    generator = np.random.default_rng(seed)
+    if selection == "random":
+        if len(pool) < budget:
+            raise ValueError(f"Scored pool holds {len(pool)} channels, needs {budget}")
+        return [pool[int(index)]
+                for index in generator.choice(len(pool), size=budget, replace=False)]
+    wanted = Counter(row["stage"] for row in ranking[:budget])
+    chosen: list[dict] = []
+    for stage, count in sorted(wanted.items()):
+        candidates = [row for row in pool if row["stage"] == stage]
+        if len(candidates) < count:
+            raise ValueError(f"Stage {stage} holds {len(candidates)} channels, needs {count}")
+        chosen.extend(candidates[int(index)]
+                      for index in generator.choice(len(candidates), size=count, replace=False))
+    return chosen
+
+
 def _protocol(baseline: Path, output: Path, device: str, teacher_config,
               teacher_checkpoint: Path, students: dict, spec: NeuronSurgerySpec) -> dict:
     source_root = Path(__file__).parent
@@ -380,7 +423,9 @@ def _protocol(baseline: Path, output: Path, device: str, teacher_config,
                          "top_fraction": 0.25, "stability_threshold": 0.7,
                          "causal_intervention": ("zero one output channel"
                                                  if spec.causal_validation else "disabled"),
-                         "preservation_accuracy_guardrail": -0.005},
+                         "preservation_accuracy_guardrail": -0.005,
+                         "channel_selection": spec.channel_selection,
+                         "channel_selection_seed": spec.channel_selection_seed},
         "repair": {"channel_budgets": list(spec.channel_budgets),
                    "learning_rates": list(spec.learning_rates), "epochs": spec.repair_epochs,
                    "samples_per_stream_per_epoch": spec.repair_samples_per_epoch,
@@ -798,10 +843,21 @@ def run_neuron_surgery_study(baseline="runs/cifar10-lt-multiseed",
 
     def localization_compute():
         ranking = causal["ranking"]
-        budgets = [budget for budget in spec.channel_budgets if len(ranking) >= budget]
+        pool = [{"stage": row["stage"], "channel": row["channel"]}
+                for row in consensus["channels"]]
+        # Budgets stay keyed to the screened ranking so every selection mode covers the
+        # same settings and budgets, keeping the arms paired.
+        budgets = [budget for budget in spec.channel_budgets
+                   if len(ranking) >= budget
+                   and (spec.channel_selection != "antiscreened" or len(ranking) >= 2 * budget)]
         return {"format_version": FORMAT_VERSION, "ranking": ranking,
+                "channel_selection": spec.channel_selection,
                 "available_channel_budgets": budgets,
-                "candidate_channels": {str(budget): ranking[:budget] for budget in budgets}}
+                "candidate_channels": {
+                    str(budget): select_channels(
+                        spec.channel_selection, ranking, pool, budget,
+                        spec.channel_selection_seed + budget)
+                    for budget in budgets}}
 
     localization = _stage_json(directory / "localization.json", localization_identity,
                                localization_compute)
